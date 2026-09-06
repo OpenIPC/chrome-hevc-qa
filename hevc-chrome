@@ -1,0 +1,105 @@
+#!/bin/bash
+# Runner for the GPU-backed Chrome container. Every command is a docker run;
+# nothing is installed on the host.
+#
+#   ./hevc-chrome build                     build the image (as your uid/gid)
+#   ./hevc-chrome vainfo                    VA-API profiles the GPU exposes
+#   ./hevc-chrome clips                     generate the test clips into clips/
+#   ./hevc-chrome sysinfo                   what Chrome's GPU process sees
+#   ./hevc-chrome caps                      codec support probes (pass/fail)
+#   ./hevc-chrome play <clip|url> [offscreen]
+#   ./hevc-chrome preview <url> [waitMs] [clickSelector] [expectCodec]
+#   ./hevc-chrome selfcheck                 vainfo + caps + 4K HEVC playback
+#   ./hevc-chrome tunnel <camera-host> [port]   ssh -L to a camera's web port (no direct route)
+#   ./hevc-chrome untunnel [port]
+#   ./hevc-chrome shell                     bash inside the container, GPU attached
+#
+# Anything after "--" goes to Chrome verbatim (e.g. -- --vmodule='*vaapi*=4').
+# Environment: CAMERA_USER / CAMERA_PASS (sign-in for the camera page
+# under test), HEVC_CHROME_IMAGE (image tag), RENDER_GID (gid of
+# /dev/dri/renderD128 if autodetection cannot see it), DOCKER_EXTRA (extra
+# docker run args), HEVC_VERBOSE=1 (print Weston's renderer lines).
+set -u
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+image=${HEVC_CHROME_IMAGE:-chrome-hevc-qa}
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+
+render_gid() {
+    if [ -n "${RENDER_GID:-}" ]; then echo "$RENDER_GID"; return; fi
+    # The host may hide /dev/dri from this shell (a sandbox); ask through docker.
+    stat -c %g /dev/dri/renderD128 2>/dev/null \
+        || docker run --rm --device /dev/dri "$image" stat -c %g /dev/dri/renderD128 2>/dev/null \
+        || echo 0
+}
+
+run() {  # run <args...>: docker run with the GPU, as the invoking user
+    # Default bridge network on purpose: with --network host Chrome offers
+    # every host interface as an ICE candidate, the peer keeps switching
+    # candidate pairs and no media arrives (README, trap 8).
+    docker run --rm --device /dev/dri --group-add "$(render_gid)" \
+        --user "$(id -u):$(id -g)" --security-opt seccomp=unconfined \
+        -v "$here/clips:/work" -e HOME=/home/qa \
+        ${CAMERA_USER:+-e CAMERA_USER="$CAMERA_USER" -e CAMERA_PASS="${CAMERA_PASS:-}"} \
+        ${HEVC_VERBOSE:+-e HEVC_VERBOSE=1} ${DOCKER_EXTRA:-} "$image" "$@"
+}
+
+clip_url() {  # a bare clip name becomes a file: url inside the container
+    case "$1" in
+        *://*) echo "$1" ;;
+        *) [ -f "$here/clips/$1" ] || { echo "no such clip: $here/clips/$1" >&2; exit 2; }; echo "file:///work/$1" ;;
+    esac
+}
+
+case "$cmd" in
+    build)
+        exec docker build --build-arg "UID=$(id -u)" --build-arg "GID=$(id -g)" \
+            ${CHROME_DEB_URL:+--build-arg CHROME_DEB_URL=$CHROME_DEB_URL} -t "$image" "$here" ;;
+    vainfo)
+        run vainfo --display drm --device /dev/dri/renderD128 ;;
+    clips)
+        run /opt/make-clips.sh ;;
+    sysinfo|caps|preview)
+        run chrome "$cmd" "$@" ;;
+    play)
+        [ $# -ge 1 ] || { echo "play needs a clip name or url" >&2; exit 2; }
+        url=$(clip_url "$1") || exit 2; shift
+        run chrome play "$url" "$@" ;;
+    selfcheck)
+        rc=0
+        echo "### 1/3 VA-API HEVC decode profiles"
+        if run vainfo --display drm --device /dev/dri/renderD128 2>/dev/null | grep -E 'VAProfileHEVCMain\s*:\s*VAEntrypointVLD'; then echo "PASS"; else echo "FAIL: no HEVC VLD profile from the driver"; rc=1; fi
+        echo; echo "### 2/3 Chrome codec support"
+        run chrome caps "$@" || rc=1
+        echo; echo "### 3/3 4K HEVC playback"
+        [ -f "$here/clips/hevc_4k.mp4" ] || run /opt/make-clips.sh >/dev/null
+        run chrome play file:///work/hevc_4k.mp4 "$@" || rc=1
+        echo; [ $rc -eq 0 ] && echo "SELFCHECK PASS" || echo "SELFCHECK FAIL"
+        exit $rc ;;
+    tunnel)
+        host=${1:?tunnel needs a camera host}; port=${2:-18080}
+        pidfile="$here/.tunnel-$port.pid"
+        if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then echo "tunnel on $port already running (pid $(cat "$pidfile"))"; exit 0; fi
+        # For a camera the container has no route to (a lab reached over ssh).
+        # Bound on all interfaces so the container reaches it via the docker
+        # bridge gateway (172.17.0.1 by default).
+        setsid nohup ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -N \
+            -L "0.0.0.0:$port:127.0.0.1:80" "root@$host" > "$here/.tunnel-$port.log" 2>&1 < /dev/null &
+        echo $! > "$pidfile"; sleep 3
+        code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "http://127.0.0.1:$port/")
+        gw=$(docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || echo 172.17.0.1)
+        echo "tunnel pid $(cat "$pidfile"): http://127.0.0.1:$port/ -> $code; inside the container use http://$gw:$port/"
+        [ "$code" != "000" ] || { echo "the camera did not answer through the tunnel:"; tail -3 "$here/.tunnel-$port.log"; exit 1; } ;;
+    untunnel)
+        port=${1:-18080}; pidfile="$here/.tunnel-$port.pid"
+        # Never pkill -f a pattern here: it matches the shell that runs it.
+        [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null && rm -f "$pidfile" && echo "tunnel on $port closed" || echo "no tunnel on $port" ;;
+    shell)
+        docker run --rm -it --device /dev/dri --group-add "$(render_gid)" --user "$(id -u):$(id -g)" \
+            --security-opt seccomp=unconfined -v "$here/clips:/work" -e HOME=/home/qa ${DOCKER_EXTRA:-} "$image" bash ;;
+    help|-h|--help)
+        sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)
+        echo "unknown command: $cmd (try help)" >&2; exit 2 ;;
+esac

@@ -1,0 +1,3 @@
+clips/*.mp4
+*.log
+.tunnel-*.pid
