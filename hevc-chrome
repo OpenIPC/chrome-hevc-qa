@@ -34,13 +34,17 @@ render_gid() {
 }
 
 run() {  # run <args...>: docker run with the GPU, as the invoking user
+    # Camera creds are passed to docker BY NAME (-e VAR, no =value): a value on
+    # the command line is readable in `ps` while the container starts. MAX_REBUILDS
+    # is forwarded the same way so the documented `live` override reaches the task.
     # Default bridge network on purpose: with --network host Chrome offers
     # every host interface as an ICE candidate, the peer keeps switching
     # candidate pairs and no media arrives (README, trap 8).
     docker run --rm --device /dev/dri --group-add "$(render_gid)" \
         --user "$(id -u):$(id -g)" --security-opt seccomp=unconfined \
         -v "$here/clips:/work" -e HOME=/home/qa \
-        ${CAMERA_USER:+-e CAMERA_USER="$CAMERA_USER" -e CAMERA_PASS="${CAMERA_PASS:-}"} \
+        ${CAMERA_USER:+-e CAMERA_USER -e CAMERA_PASS} \
+        ${MAX_REBUILDS:+-e MAX_REBUILDS} \
         ${HEVC_VERBOSE:+-e HEVC_VERBOSE=1} ${DOCKER_EXTRA:-} "$image" "$@"
 }
 

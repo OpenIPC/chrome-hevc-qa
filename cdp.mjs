@@ -301,7 +301,7 @@ async function main() {
     // session, on the page's side and on the camera's.
     const url = taskArgs[0];
     if (!url) throw new Error('live needs a url');
-    const waitMs = +(taskArgs[1] || 30000);
+    const waitMs = Math.max(3000, +(taskArgs[1]) || 30000);  // never 0: an empty run has no `last` sample
     const transport = taskArgs[2] || '';
     const stream = taskArgs[3] || '';
     // How many in-place MediaSource rebuilds the visible player may make
@@ -328,13 +328,16 @@ async function main() {
       const HookedWS = function (u, p) {
         const s = p === undefined ? new OrigWS(u) : new OrigWS(u, p);
         const rec = { url: String(u).replace(/^wss?:\\/\\/[^/]+/, ''), created: Math.round(performance.now()),
-                      opened: null, closed: null, code: null, bytes: 0, msgs: 0, texts: [], sock: s };
+                      opened: null, closed: null, code: null, bytes: 0, msgs: 0, inits: 0, texts: [], sock: s };
         s.addEventListener('open', () => { rec.opened = Math.round(performance.now()); });
         s.addEventListener('close', e => { rec.closed = Math.round(performance.now()); rec.code = e.code; });
         s.addEventListener('message', e => {
           rec.msgs++;
-          if (typeof e.data === 'string') { if (rec.texts.length < 40) rec.texts.push(e.data.slice(0, 160)); }
-          else rec.bytes += e.data.byteLength || e.data.size || 0;
+          if (typeof e.data === 'string') {
+            // Count init announcements unbounded; keep only a few for display.
+            if (/"init"/.test(e.data)) rec.inits++;
+            if (rec.texts.length < 8) rec.texts.push(e.data.slice(0, 160));
+          } else rec.bytes += e.data.byteLength || e.data.size || 0;
         });
         window.__ws.push(rec);
         return s;
@@ -345,7 +348,7 @@ async function main() {
       window.__mjSample = async function () {
         const t = Math.round(performance.now());
         const sockets = window.__ws.map(r => ({ url: r.url, created: r.created, opened: r.opened, closed: r.closed,
-          code: r.code, state: r.sock.readyState, bytes: r.bytes, msgs: r.msgs, texts: r.texts }));
+          code: r.code, state: r.sock.readyState, bytes: r.bytes, msgs: r.msgs, inits: r.inits, texts: r.texts }));
         const videos = [...document.querySelectorAll('video')].map(v => {
           // Stalls and seeks per element, counted from the first sample that
           // sees it; the MSE player replaces its element on a reconnect, so a
@@ -376,6 +379,13 @@ async function main() {
     const t0 = Date.now();
     const samples = [];
     let maxPageOpen = 0, maxCamera = 0;
+    // The camera-wide ws_video_clients_total gauge counts every viewer, not
+    // just this tab. Baseline the others on the first reading so the leak
+    // check judges only THIS run's contribution -- otherwise a second viewer
+    // already watching fails a clean run. The page-side count is this tab's
+    // own sockets and needs no baseline; it is watched from the first sample
+    // so a leak that opens and closes during startup is not missed.
+    let baseOthers = null;
     while (Date.now() - t0 < waitMs) {
       await sleep(1000);
       const s = await evaluate(sid, 'window.__mjSample()');
@@ -383,7 +393,9 @@ async function main() {
       const vid = s.sockets.filter(x => /\/ws\/video/.test(x.url));
       const open = vid.filter(x => x.state === 1).length;
       const cam = s.metrics && s.metrics.ws_video_clients_total;
-      if (samples.length > 3) { maxPageOpen = Math.max(maxPageOpen, open); if (cam != null) maxCamera = Math.max(maxCamera, cam); }
+      if (baseOthers === null && cam != null) baseOthers = Math.max(0, cam - open);
+      maxPageOpen = Math.max(maxPageOpen, open);
+      if (cam != null) maxCamera = Math.max(maxCamera, cam - (baseOthers || 0));
       const live = s.videos.find(v => v.shown) || s.videos[0];
       // Bytes the page's sockets delivered this second against what the
       // encoder produced (camera counter): a ratio near 1 is one copy of the
@@ -398,7 +410,7 @@ async function main() {
         const enc = (s.metrics[ch] - prev.metrics[ch]) * 8 / 1000 / dtS;
         rate = ` rx=${Math.round(rx)} enc=${Math.round(enc)} kbit/s${enc > 50 ? ' x' + (rx / enc).toFixed(2) : ''}`;
       }
-      const inits = vid.reduce((n, x) => n + x.texts.filter(t => /"init"/.test(t)).length, 0);
+      const inits = vid.reduce((n, x) => n + (x.inits || 0), 0);
       console.log(`t=${(s.t / 1000).toFixed(1)}s ws/video page open=${open} of ${vid.length} camera=${cam == null ? '?' : cam}` +
         ` webrtc=${s.metrics && s.metrics.webrtc_sessions_total}${rate} inits=${inits} | ` +
         (live ? `${live.id} ${live.w}x${live.h} frames=${live.total} dropped=${live.dropped} ahead=${live.ahead}s stalls=${live.waiting} seeks=${live.seeking} loads=${live.loads} rs=${live.rs}${live.err ? ' ERR' + live.err : ''}` : 'no video') +
@@ -418,8 +430,9 @@ async function main() {
     // MSE. `loads` is per element instance; a socket reconnect makes a fresh
     // element (loads back to 0), so a high count on the element that ends
     // visible is repeated in-place rebuilds, not reconnects.
+    if (!last) { console.log('FAIL: no samples collected (waitMs too small?)'); return false; }
     const vidLast = last.sockets.filter(x => /\/ws\/video/.test(x.url));
-    const initFrames = vidLast.reduce((n, x) => n + x.texts.filter(t => /"init"/.test(t)).length, 0);
+    const initFrames = vidLast.reduce((n, x) => n + (x.inits || 0), 0);
     const live = last.videos.find(v => v.shown);
     const reloads = live ? (live.loads || 0) : 0;
     console.log(`summary: init segments seen=${initFrames}, visible-element rebuilds=${reloads}, stalls=${live ? live.waiting : '-'}`);
