@@ -21,6 +21,15 @@
 //                                    decoded; fails without inbound video
 //                                    frames, or if the codec is not
 //                                    expectCodec (e.g. H265)
+//   live <url> [waitMs] [transport] [stream]
+//                                    load the WebUI Live page, optionally
+//                                    with a remembered transport ('mse' or
+//                                    'webrtc') and stream (0 or 1), and
+//                                    report once a second every WebSocket
+//                                    the page holds, the visible element's
+//                                    frame counts and the camera's own
+//                                    consumer gauges; fails if one tab ever
+//                                    holds more than one /ws/video session
 //
 // Environment: CAMERA_USER / CAMERA_PASS sign in to the camera's web
 // interface for http(s) urls (play and preview): a POST to /login from the
@@ -276,6 +285,162 @@ async function main() {
     else if (expectCodec && !vid.some(i => (i.codec || '').toUpperCase().includes(expectCodec.toUpperCase()))) {
       console.log('FAIL: decoded ' + vid.map(i => i.codec).join(' / ') + ', expected ' + expectCodec); ok = false;
     } else console.log('PASS: ' + vid.map(i => i.framesDecoded + ' frames of ' + i.codec).join('; '));
+  } else if (task === 'live') {
+    // live <url> [waitMs] [transport] [stream]
+    //
+    // Watch the WebUI's Live page carry a stream over MSE (or whatever the
+    // page chooses) and count what it costs the camera. Every WebSocket the
+    // page opens is recorded from before its scripts run -- url, open/close
+    // times, bytes -- and once a second the page is asked for its video
+    // elements' playback quality, the chip text, and the camera's own
+    // /metrics consumer gauges over the same session cookie. `transport`
+    // ('mse' or 'webrtc') and `stream` (0 or 1) are written into
+    // localStorage the way the page's own radio buttons would, so a run can
+    // reproduce a viewer's remembered choice. The check is one the page's
+    // own stats panel cannot make: that a single tab holds ONE /ws/video
+    // session, on the page's side and on the camera's.
+    const url = taskArgs[0];
+    if (!url) throw new Error('live needs a url');
+    const waitMs = Math.max(3000, +(taskArgs[1]) || 30000);  // never 0: an empty run has no `last` sample
+    const transport = taskArgs[2] || '';
+    const stream = taskArgs[3] || '';
+    // How many in-place MediaSource rebuilds the visible player may make
+    // before the run is judged a re-init thrash. One initial load is normal;
+    // a couple more tolerate a reconnect. Dozens is the flash. Override with
+    // MAX_REBUILDS.
+    const MAX_REBUILDS = +(process.env.MAX_REBUILDS || 3);
+    const consoleLines = [];
+    listeners.push(m => {
+      if (m.sessionId !== sid) return;
+      if (m.method === 'Runtime.consoleAPICalled')
+        consoleLines.push(Math.round(m.params.timestamp) + ' ' + m.params.type + ': ' + m.params.args.map(a => a.value !== undefined ? String(a.value) : (a.description || a.type)).join(' ').slice(0, 300));
+      else if (m.method === 'Runtime.exceptionThrown')
+        consoleLines.push('exception: ' + (m.params.exceptionDetails.exception && m.params.exceptionDetails.exception.description || m.params.exceptionDetails.text).slice(0, 300));
+    });
+    await send('Page.addScriptToEvaluateOnNewDocument', { source: `
+      try {
+        const tp = ${JSON.stringify(transport)}, st = ${JSON.stringify(stream)};
+        if (tp) { localStorage.setItem('mj-transport-pick', tp); localStorage.removeItem('mj-transport-auto'); localStorage.removeItem('mj-transport'); }
+        if (st) { localStorage.setItem('mj-preview-stream:preview', st); localStorage.removeItem('mj-preview-stream'); }
+      } catch (e) {}
+      window.__ws = [];
+      const OrigWS = window.WebSocket;
+      const HookedWS = function (u, p) {
+        const s = p === undefined ? new OrigWS(u) : new OrigWS(u, p);
+        const rec = { url: String(u).replace(/^wss?:\\/\\/[^/]+/, ''), created: Math.round(performance.now()),
+                      opened: null, closed: null, code: null, bytes: 0, msgs: 0, inits: 0, texts: [], sock: s };
+        s.addEventListener('open', () => { rec.opened = Math.round(performance.now()); });
+        s.addEventListener('close', e => { rec.closed = Math.round(performance.now()); rec.code = e.code; });
+        s.addEventListener('message', e => {
+          rec.msgs++;
+          if (typeof e.data === 'string') {
+            // Count init announcements unbounded; keep only a few for display.
+            if (/"init"/.test(e.data)) rec.inits++;
+            if (rec.texts.length < 8) rec.texts.push(e.data.slice(0, 160));
+          } else rec.bytes += e.data.byteLength || e.data.size || 0;
+        });
+        window.__ws.push(rec);
+        return s;
+      };
+      HookedWS.prototype = OrigWS.prototype; Object.setPrototypeOf(HookedWS, OrigWS);
+      for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) HookedWS[k] = OrigWS[k];
+      window.WebSocket = HookedWS;
+      window.__mjSample = async function () {
+        const t = Math.round(performance.now());
+        const sockets = window.__ws.map(r => ({ url: r.url, created: r.created, opened: r.opened, closed: r.closed,
+          code: r.code, state: r.sock.readyState, bytes: r.bytes, msgs: r.msgs, inits: r.inits, texts: r.texts }));
+        const videos = [...document.querySelectorAll('video')].map(v => {
+          // Stalls and seeks per element, counted from the first sample that
+          // sees it; the MSE player replaces its element on a reconnect, so a
+          // fresh element starts from zero and says so through its counts.
+          if (!v.__mj) { v.__mj = { waiting: 0, seeking: 0, srcs: 0 };
+            v.addEventListener('waiting', () => v.__mj.waiting++);
+            v.addEventListener('seeking', () => v.__mj.seeking++);
+            v.addEventListener('loadstart', () => v.__mj.srcs++); }
+          const q = v.getVideoPlaybackQuality(); let ahead = null;
+          try { if (v.buffered.length) ahead = +(v.buffered.end(v.buffered.length - 1) - v.currentTime).toFixed(2); } catch (e) {}
+          return { id: v.id, shown: getComputedStyle(v).display !== 'none', rs: v.readyState, w: v.videoWidth, h: v.videoHeight,
+                   total: q.totalVideoFrames, dropped: q.droppedVideoFrames, ct: +v.currentTime.toFixed(2), ahead, paused: v.paused,
+                   waiting: v.__mj.waiting, seeking: v.__mj.seeking, loads: v.__mj.srcs,
+                   err: v.error ? v.error.code : null };
+        });
+        const badge = document.querySelector('#mj-badge');
+        let metrics = null;
+        try {
+          const txt = await (await fetch('/metrics', { credentials: 'same-origin', cache: 'no-store' })).text();
+          metrics = {};
+          for (const k of ['ws_video_clients_total', 'webrtc_sessions_total', 'venc0_rcvd_bytes', 'venc1_rcvd_bytes'])
+            { const r = new RegExp('^' + k + ' (\\\\S+)', 'm').exec(txt); if (r) metrics[k] = +r[1]; }
+        } catch (e) { metrics = { error: String(e) }; }
+        return { t, sockets, videos, badge: badge && badge.textContent.trim(), metrics };
+      };` }, sid);
+    if (!(await signIn(sid, url))) return false;
+    await navigate(sid, url);
+    const t0 = Date.now();
+    const samples = [];
+    let maxPageOpen = 0, maxCamera = 0;
+    // The camera-wide ws_video_clients_total gauge counts every viewer, not
+    // just this tab. Baseline the others on the first reading so the leak
+    // check judges only THIS run's contribution -- otherwise a second viewer
+    // already watching fails a clean run. The page-side count is this tab's
+    // own sockets and needs no baseline; it is watched from the first sample
+    // so a leak that opens and closes during startup is not missed.
+    let baseOthers = null;
+    while (Date.now() - t0 < waitMs) {
+      await sleep(1000);
+      const s = await evaluate(sid, 'window.__mjSample()');
+      samples.push(s);
+      const vid = s.sockets.filter(x => /\/ws\/video/.test(x.url));
+      const open = vid.filter(x => x.state === 1).length;
+      const cam = s.metrics && s.metrics.ws_video_clients_total;
+      if (baseOthers === null && cam != null) baseOthers = Math.max(0, cam - open);
+      maxPageOpen = Math.max(maxPageOpen, open);
+      if (cam != null) maxCamera = Math.max(maxCamera, cam - (baseOthers || 0));
+      const live = s.videos.find(v => v.shown) || s.videos[0];
+      // Bytes the page's sockets delivered this second against what the
+      // encoder produced (camera counter): a ratio near 1 is one copy of the
+      // stream; 2 means the page is being sent everything twice.
+      const prev = samples[samples.length - 2];
+      let rate = '';
+      if (prev && prev.metrics && s.metrics && s.metrics.venc0_rcvd_bytes != null) {
+        const dtS = (s.t - prev.t) / 1000;
+        const sum = a => a.filter(x => /\/ws\/video/.test(x.url)).reduce((n, x) => n + x.bytes, 0);
+        const rx = (sum(s.sockets) - sum(prev.sockets)) * 8 / 1000 / dtS;
+        const ch = /stream=1/.test((vid[vid.length - 1] || {}).url || '') ? 'venc1_rcvd_bytes' : 'venc0_rcvd_bytes';
+        const enc = (s.metrics[ch] - prev.metrics[ch]) * 8 / 1000 / dtS;
+        rate = ` rx=${Math.round(rx)} enc=${Math.round(enc)} kbit/s${enc > 50 ? ' x' + (rx / enc).toFixed(2) : ''}`;
+      }
+      const inits = vid.reduce((n, x) => n + (x.inits || 0), 0);
+      console.log(`t=${(s.t / 1000).toFixed(1)}s ws/video page open=${open} of ${vid.length} camera=${cam == null ? '?' : cam}` +
+        ` webrtc=${s.metrics && s.metrics.webrtc_sessions_total}${rate} inits=${inits} | ` +
+        (live ? `${live.id} ${live.w}x${live.h} frames=${live.total} dropped=${live.dropped} ahead=${live.ahead}s stalls=${live.waiting} seeks=${live.seeking} loads=${live.loads} rs=${live.rs}${live.err ? ' ERR' + live.err : ''}` : 'no video') +
+        ` | ${s.badge || ''}`);
+    }
+    const last = samples[samples.length - 1];
+    console.log('sockets: ' + JSON.stringify(last.sockets.map(x => ({ ...x, texts: x.texts.map(t => t.slice(0, 120)) })), null, 1));
+    console.log('videos: ' + JSON.stringify(last.videos));
+    if (consoleLines.length) { console.log('--- page console ---'); for (const l of consoleLines.slice(0, 60)) console.log(l); }
+    // The init text frames the visible stream's socket carried, and how many
+    // times the visible element was handed a fresh source. In a steady MSE
+    // session both are ~1: one init, one load. A camera that re-announces the
+    // stream every keyframe (majestic-webui#269/#335) drives `inits` up once
+    // per keyframe; whether that COSTS anything is the reload count, because a
+    // player that rebuilds MediaSource for each re-announcement resets the
+    // decoder every time -- the Safari flash, and the jerky H.265 in Chrome
+    // MSE. `loads` is per element instance; a socket reconnect makes a fresh
+    // element (loads back to 0), so a high count on the element that ends
+    // visible is repeated in-place rebuilds, not reconnects.
+    if (!last) { console.log('FAIL: no samples collected (waitMs too small?)'); return false; }
+    const vidLast = last.sockets.filter(x => /\/ws\/video/.test(x.url));
+    const initFrames = vidLast.reduce((n, x) => n + (x.inits || 0), 0);
+    const live = last.videos.find(v => v.shown);
+    const reloads = live ? (live.loads || 0) : 0;
+    console.log(`summary: init segments seen=${initFrames}, visible-element rebuilds=${reloads}, stalls=${live ? live.waiting : '-'}`);
+    if (!live || !live.total) { console.log('FAIL: no video frames decoded on the visible element'); ok = false; }
+    else if (maxPageOpen > 1 || maxCamera > 1) { console.log(`FAIL: one tab held ${maxPageOpen} open /ws/video sockets (camera counted ${maxCamera})`); ok = false; }
+    else if (reloads > MAX_REBUILDS) { console.log(`FAIL: the visible player rebuilt ${reloads} times (> ${MAX_REBUILDS}) -- /ws/video init re-emit resets the MSE decoder (majestic-webui#269/#335)`); ok = false; }
+    else console.log(`PASS: one /ws/video session, ${live.total} frames, ${live.dropped} dropped (${(100 * live.dropped / live.total).toFixed(1)}%), ${reloads} rebuild(s), ${initFrames} init(s)`);
+    printStderr(/vaapi|VA-API|decoder|Decoder|hevc|HEVC|h265|H265|GPU process|Context was lost|SharedImage/i);
   } else {
     throw new Error('unknown task ' + task);
   }
