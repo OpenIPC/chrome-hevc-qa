@@ -59,7 +59,7 @@ case "$cmd" in
         run vainfo --display drm --device /dev/dri/renderD128 ;;
     clips)
         run /opt/make-clips.sh ;;
-    sysinfo|caps|preview)
+    sysinfo|caps|preview|live)
         run chrome "$cmd" "$@" ;;
     play)
         [ $# -ge 1 ] || { echo "play needs a clip name or url" >&2; exit 2; }

@@ -52,6 +52,7 @@ breaks, in order, so a failure names the stage.
 | `./hevc-chrome caps` | codec support table (`canPlayType`, MSE, mediaCapabilities, WebRTC receive/send); fails unless HEVC Main is supported |
 | `./hevc-chrome play <clip\|url> [offscreen]` | play a video, report decoded size, frames decoded and dropped; fails on a media error or under `MIN_FRAMES` (default 10) |
 | `./hevc-chrome preview <url> [waitMs] [clickSelector] [expectCodec]` | load a page that opens its own WebRTC session, report what it negotiated and decoded |
+| `./hevc-chrome live <url> [waitMs] [transport] [stream]` | load the WebUI Live page over MSE (or WebRTC), sample every socket and the visible `<video>` once a second; fails on >1 `/ws/video` session per tab or on repeated MediaSource rebuilds (init re-emit thrash) |
 | `./hevc-chrome selfcheck` | `vainfo` + `caps` + `play hevc_4k.mp4` |
 | `./hevc-chrome tunnel <camera> [port]` / `untunnel [port]` | ssh port forward to a camera's web port when the container has no route to it (see below) |
 | `./hevc-chrome shell` | bash inside the container with the GPU attached |
@@ -142,6 +143,42 @@ click #mj-stream-0: clicked
   "answerVideo": "m=video 48468 UDP/TLS/RTP/SAVPF 49 | a=rtpmap:49 H265/90000 | a=fmtp:49 level-id=186;..." }
 PASS: 339 frames of video/H265 level-id=186;profile-id=1;tier-flag=0;tx-mode=SRST
 ```
+
+## Watching the Live page over MSE
+
+The `preview` task above only sees WebRTC. The `live` task drives the whole
+Live page as a person would, over whichever transport the page (or a
+remembered choice) picks, and is built for the MSE path in particular — where
+the picture is fMP4 fragments over a `/ws/video` WebSocket rather than an
+`RTCPeerConnection` that `getStats()` can read.
+
+```sh
+CAMERA_USER=root CAMERA_PASS='...' \
+./hevc-chrome live http://<camera>/cgi-bin/live.cgi 60000 mse 0
+```
+
+`transport` is `mse` or `webrtc` and `stream` is `0` (Main) or `1` (Sub); both
+are written into the page's own `localStorage` keys before its scripts run, so
+the run reproduces exactly what a viewer with that remembered choice sees. Both
+are optional — omit them to let the page choose.
+
+Each second it prints the open `/ws/video` sockets (page-side and the camera's
+own `ws_video_clients_total`), the visible element's decoded/dropped frame
+counts, how many init segments the socket has carried, how many times the
+element was handed a fresh source, and the received-vs-encoded byte ratio. Two
+failures it is designed to catch:
+
+- **More than one `/ws/video` session for one tab** — a socket leak
+  (majestic-webui#298). Counted on both ends.
+- **The visible player rebuilding MediaSource repeatedly** — the camera
+  re-emitting the fMP4 init segment (say once per keyframe) makes the MSE
+  player tear the decoder down and build it again each time, which is a black
+  flash in Safari and a stall-and-restart loop in Chrome
+  (majestic-webui#269/#335). The signature is `init segments seen` climbing
+  while decoded frames never accumulate and `visible-element rebuilds` grows;
+  the run fails past `MAX_REBUILDS` (default 3). A camera that re-announces the
+  stream but whose player *absorbs* it shows the inits climbing with rebuilds
+  staying at 1 — which is how a fix is proven.
 
 ## How it works
 
