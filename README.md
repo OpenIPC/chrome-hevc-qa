@@ -54,6 +54,7 @@ breaks, in order, so a failure names the stage.
 | `./hevc-chrome preview <url> [waitMs] [clickSelector] [expectCodec]` | load a page that opens its own WebRTC session, report what it negotiated and decoded |
 | `./hevc-chrome live <url> [waitMs] [transport] [stream]` | load the WebUI Live page over MSE (or WebRTC), sample every socket and the visible `<video>` once a second; fails on >1 `/ws/video` session per tab or on repeated MediaSource rebuilds (init re-emit thrash) |
 | `./hevc-chrome dc <url> [seconds] [stream] [mode]` | the camera's video bitstream over an `RTCDataChannel`: offer a data-only PeerConnection on the camera's WebRTC signalling socket, check every message against the published header, ask for a keyframe halfway; mode `negotiated` (default), `dcep` (in-band open) or `mixed` (a video track beside the channel) |
+| `./hevc-chrome bench <url> [seconds] [feed] [stream] [decoder]` | one measured Live-page run over the buffered transport (MSE, or the software rung with `decoder=wasm`), the bytes carried by `feed=datachannel` or `websocket`: capture-to-arrival lag percentiles from the fragments' producer reference times, frame rate, drops, gaps, stalls, bit rate, round trip, as JSON; fails unless the requested feed and decoder held every tick with the tab visible (`BENCH_WARMUP_S`, `BENCH_LABEL`, `BENCH_ICE`) |
 | `./hevc-chrome selfcheck` | `vainfo` + `caps` + `play hevc_4k.mp4` |
 | `./hevc-chrome tunnel <camera> [port]` / `untunnel [port]` | ssh port forward to a camera's web port when the container has no route to it (see below) |
 | `./hevc-chrome shell` | bash inside the container with the GPU attached |
@@ -207,6 +208,10 @@ camera-flagged gaps, late arrivals, `prft` presence, split messages (a 4K
 keyframe exceeds Chrome's 256 KiB message limit) and the camera's own
 `dc=` stats keys. The page-side probe lives in `web/dc-probe.js` so another
 browser under another driver can run the identical check.
+
+## Measuring a feed
+
+`bench` is the instrument behind a WebSocket-versus-data-channel comparison: the same Live page, camera and decoder, one feed pinned per run, and the players' own per-second stats teed off the page (not read off its panel) and aggregated after a warm-up. Every run reports the lag percentiles, the frame rate, the dropped and discarded frames, the stalls, the camera-flagged gaps and sequence holes, the received bit rate and the round trip, and whether the requested feed and decoder held on every tick with the tab visible — a run that drifted to the other feed is a FAIL, not a number. Alternate the feeds (`WS DC DC WS …`) and take medians; put the browser behind an impaired path (a container with `tc netem`, joined with `DOCKER_EXTRA="--network container:<netns>"`) to measure loss and capacity cells. `WASM_BASE` points the software rung at a decoder build served elsewhere; `BENCH_ICE` names a relay for the cells where only a relay can carry the session.
 
 ## How it works
 
