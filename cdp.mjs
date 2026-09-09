@@ -51,7 +51,8 @@
 //                                    producer reference times, fps, drops,
 //                                    gaps, stalls, bit rate, round trip, as
 //                                    JSON (BENCH_OUT=file, BENCH_LABEL=name,
-//                                    BENCH_WARMUP_S=10); fails unless the
+//                                    BENCH_WARMUP_S=10, BENCH_SAMPLES=1 keeps
+//                                    the per-second samples); fails unless the
 //                                    requested feed and decoder held every
 //                                    tick with the tab visible
 //   dc <url> [seconds] [stream] [mode] the camera's video bitstream over an
@@ -730,6 +731,11 @@ async function main() {
       camDc: camCount.length ? Math.max(...camCount.map(c => c.dc || 0)) : null,
       console: consoleLines.slice(0, 8),
     };
+    // BENCH_SAMPLES=1 keeps the per-second samples themselves (minus the raw
+    // lag arrays), so a run's shape — when a gap came, how long the picture
+    // waited for a keyframe, what the camera's counters did — can be read
+    // back instead of inferred from the totals.
+    if (process.env.BENCH_SAMPLES) res.timeline = kept.map(s => { const o = Object.assign({}, s); delete o.lagMs; o.t = +((s.at - t0) / 1000).toFixed(1); delete o.at; return o; });
     res.pass = res.samples >= Math.max(3, (seconds - warmup) / 2) && res.framesPerTickOk && res.feedEvery && res.decoderEvery && res.visibleEvery && (res.camWs == null || res.camWs <= 1) && (res.camDc == null || res.camDc <= 1);
     res.reason = !res.samples ? 'no samples after warm-up' : !res.framesPerTickOk ? 'a tick with no frames' : !res.feedEvery ? 'feed was ' + JSON.stringify([...new Set(feeds)]) : !res.decoderEvery ? 'decoder was ' + JSON.stringify([...new Set(decoders)]) : !res.visibleEvery ? 'the tab was not visible throughout' : (res.camWs > 1 || res.camDc > 1) ? 'the camera counted more than one session' : 'ok';
     const json = JSON.stringify(res, null, 1);
