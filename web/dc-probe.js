@@ -11,12 +11,16 @@
 //       'mixed' — the channel beside a recvonly video transceiver, the
 //       two bundled on one transport.
 //
+// opts: { iceServers, iceTransportPolicy } for the RTCPeerConnection — a
+//       relay for a viewer with no direct path to the camera; the default
+//       is no servers, which on a LAN is enough.
+//
 // Every message is checked against the published header (magic 0xA5,
 // version 1, kind, flags, part/parts, seq, queue delay) and its payload's
 // first box. Halfway through, a keyframe is requested the two ways a page
 // can ask — on the channel and on the signalling socket — and the reply is
 // timed. Returns a JSON-able summary; the driver decides PASS/FAIL.
-window.__dcProbe = async (seconds, stream, mode) => {
+window.__dcProbe = async (seconds, stream, mode, opts) => {
   const t0 = performance.now();
   const now = () => Math.round(performance.now() - t0);
   const st = { stream, openAt: null, firstAt: null, msgs: 0, bytes: 0, bad: 0,
@@ -26,7 +30,8 @@ window.__dcProbe = async (seconds, stream, mode) => {
     idrAskedAt: null, initAfterAsk: null, keyframeAfterAsk: null, codec: null };
   const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/webrtc?stream=' + stream;
   const ws = new WebSocket(wsUrl);
-  const pc = new RTCPeerConnection({ iceServers: [] });
+  opts = opts || {};
+  const pc = new RTCPeerConnection({ iceServers: opts.iceServers || [], iceTransportPolicy: opts.iceTransportPolicy || 'all' });
   mode = mode || 'negotiated';
   st.mode = mode;
   if (mode === 'mixed') pc.addTransceiver('video', { direction: 'recvonly' });
