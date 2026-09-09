@@ -141,7 +141,10 @@ async function evaluate(sid, expression) {
 // navigation commits destroys the execution context and the call never
 // returns, which looks exactly like a hung server.
 async function navigate(sid, url) {
-  const loaded = waitEvent('Page.loadEventFired', sid);
+  // Two minutes: a page behind a capped link, with its stream already
+  // taking most of it, can take a minute to load; a broken one fails the
+  // harness at two rather than the default half.
+  const loaded = waitEvent('Page.loadEventFired', sid, 120000);
   await send('Page.navigate', { url }, sid);
   await loaded;
 }
