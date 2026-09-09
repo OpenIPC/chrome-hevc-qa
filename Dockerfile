@@ -40,6 +40,7 @@ COPY docker/entry.sh /opt/entry.sh
 COPY docker/make-clips.sh /opt/make-clips.sh
 COPY cdp.mjs /opt/cdp.mjs
 COPY web/blank.html /opt/web/blank.html
+COPY web/dc-probe.js /opt/web/dc-probe.js
 RUN chmod +x /opt/entry.sh /opt/make-clips.sh
 
 USER qa

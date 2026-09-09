@@ -53,6 +53,7 @@ breaks, in order, so a failure names the stage.
 | `./hevc-chrome play <clip\|url> [offscreen]` | play a video, report decoded size, frames decoded and dropped; fails on a media error or under `MIN_FRAMES` (default 10) |
 | `./hevc-chrome preview <url> [waitMs] [clickSelector] [expectCodec]` | load a page that opens its own WebRTC session, report what it negotiated and decoded |
 | `./hevc-chrome live <url> [waitMs] [transport] [stream]` | load the WebUI Live page over MSE (or WebRTC), sample every socket and the visible `<video>` once a second; fails on >1 `/ws/video` session per tab or on repeated MediaSource rebuilds (init re-emit thrash) |
+| `./hevc-chrome dc <url> [seconds] [stream] [mode]` | the camera's video bitstream over an `RTCDataChannel`: offer a data-only PeerConnection on the camera's WebRTC signalling socket, check every message against the published header, ask for a keyframe halfway; mode `negotiated` (default), `dcep` (in-band open) or `mixed` (a video track beside the channel) |
 | `./hevc-chrome selfcheck` | `vainfo` + `caps` + `play hevc_4k.mp4` |
 | `./hevc-chrome tunnel <camera> [port]` / `untunnel [port]` | ssh port forward to a camera's web port when the container has no route to it (see below) |
 | `./hevc-chrome shell` | bash inside the container with the GPU attached |
@@ -179,6 +180,33 @@ failures it is designed to catch:
   the run fails past `MAX_REBUILDS` (default 3). A camera that re-announces the
   stream but whose player *absorbs* it shows the inits climbing with rebuilds
   staying at 1 — which is how a fix is proven.
+
+## Testing the data channel
+
+A camera that carries its live fMP4 bitstream over a WebRTC data channel
+(OpenIPC/majestic-webui#285) answers a data-only offer on the same
+signalling socket the media path uses (`/ws/webrtc?stream=N`). The `dc`
+task is that offer, made by real Chrome, with a pre-negotiated channel
+(`id 0`, unordered, no retransmits) the way a page would open one:
+
+```
+CAMERA_USER=... CAMERA_PASS=... ./hevc-chrome dc http://camera/ 16 1
+CAMERA_USER=... CAMERA_PASS=... ./hevc-chrome dc http://camera/ 16 1 dcep    # in-band open
+CAMERA_USER=... CAMERA_PASS=... ./hevc-chrome dc http://camera/ 16 1 mixed   # a video track beside it
+```
+
+Every message is checked against the header the camera publishes (magic
+`0xA5`, version 1, kind, flags, part/parts, seq, queue delay) and the first
+box of its payload (`ftyp` for an init segment, `moof` or `prft` for a
+frame). Halfway through, a keyframe is requested both ways a page can ask —
+on the channel and on the signalling socket — and the fresh init segment
+and keyframe are timed. The verdict fails on a declined section (a camera
+without the support answers port 0), a channel that never opens, a bad
+header, or an unanswered request; it reports frame rate, sequence holes,
+camera-flagged gaps, late arrivals, `prft` presence, split messages (a 4K
+keyframe exceeds Chrome's 256 KiB message limit) and the camera's own
+`dc=` stats keys. The page-side probe lives in `web/dc-probe.js` so another
+browser under another driver can run the identical check.
 
 ## How it works
 

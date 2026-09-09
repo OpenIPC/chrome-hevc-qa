@@ -38,6 +38,17 @@
 //                                    evaluates to once a second (a promise
 //                                    is awaited), for probing a page's own
 //                                    state while the camera is poked
+//   dc <url> [seconds] [stream] [mode] the camera's video bitstream over an
+//                                    RTCDataChannel: offer a data-only
+//                                    PeerConnection on /ws/webrtc?stream=N,
+//                                    check every message's header and first
+//                                    box, ask for a keyframe halfway, report
+//                                    rates, holes, gaps and the camera's own
+//                                    dc= stats; fails on a declined section,
+//                                    a channel that never opens, a bad
+//                                    header, or an unanswered request;
+//                                    mode negotiated (default), dcep (an
+//                                    in-band open) or mixed (video beside it)
 //
 // Environment: CAMERA_USER / CAMERA_PASS sign in to the camera's web
 // interface for http(s) urls (play and preview): a POST to /login from the
@@ -47,6 +58,7 @@
 // --no-sandbox (needed when running as root), CDP_ALL_STDERR=1 prints every
 // Chrome stderr line instead of the media-related ones.
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 const [, , chrome, task, ...rest] = process.argv;
 const sep = rest.indexOf('--');
@@ -519,6 +531,52 @@ async function main() {
       console.log('t=' + ((Date.now() - t0) / 1000).toFixed(1) + 's ' + r);
       await sleep(1000);
     }
+  } else if (task === 'dc') {
+    // dc <url> [seconds] [stream]: the camera's video bitstream over an
+    // RTCDataChannel. Signs in, offers a data-only PeerConnection over the
+    // camera's WebRTC signalling socket (/ws/webrtc?stream=N) with one
+    // pre-negotiated channel (id 0, unordered, no retransmits), and counts
+    // what arrives for <seconds>: every message is checked against the
+    // published header (magic 0xA5, version 1, kind, flags, part/parts, seq,
+    // queue delay) and its payload's first box. Halfway through it asks for
+    // a keyframe the way a page does, on the channel and on the signalling
+    // socket, and expects a fresh init segment with the next keyframe.
+    // Prints a JSON summary, the camera's own stats lines, and PASS/FAIL.
+    const url = taskArgs[0];
+    if (!url) throw new Error('dc needs a url');
+    const seconds = +(taskArgs[1] || 15);
+    const stream = +(taskArgs[2] || 0);
+    const mode = taskArgs[3] || 'negotiated';
+    // The probe is a page script shared with other browsers' checks; read
+    // here and evaluated on the camera's origin.
+    const probeSource = readFileSync(new URL('./web/dc-probe.js', import.meta.url), 'utf8');
+    listeners.push(m => {
+      if (m.sessionId === sid && m.method === 'Runtime.consoleAPICalled')
+        console.log('console.' + m.params.type + ': ' + m.params.args.map(a => a.value !== undefined ? String(a.value) : (a.description || a.type)).join(' ').slice(0, 300));
+    });
+    if (!(await signIn(sid, url))) return false;
+    // Stay on the camera's origin (the sign-in page carries no player, so
+    // the probe's session is the only one this tab opens).
+    const origin = new URL(url).origin;
+    if (!process.env.CAMERA_USER) await navigate(sid, origin + '/login.html');
+    const out = await evaluate(sid, `(async () => {
+      ${probeSource}
+      return window.__dcProbe(${seconds}, ${stream}, ${JSON.stringify(mode)});
+    })()`);
+    console.log(JSON.stringify(out, null, 1));
+    const camDcUp = out.stats.some(l => /\bdc=up\b/.test(l));
+    if (out.answerDeclined) { console.log('FAIL: the camera declined the data section (port 0) -- no data-channel support in this build'); ok = false; }
+    else if (!out.answerHasData) { console.log('FAIL: no answer with an application section; errors: ' + JSON.stringify(out.errors)); ok = false; }
+    else if (out.openAt === null) { console.log('FAIL: the channel never opened (ice ' + out.ice.join(' ') + '); errors: ' + JSON.stringify(out.errors)); ok = false; }
+    else if (out.bad || out.badBox) { console.log(`FAIL: ${out.bad} message(s) with a bad header, ${out.badBox} with a wrong first box`); ok = false; }
+    else if (out.kinds.init < 1 || out.kinds.initSeg < 1) { console.log('FAIL: no init messages (kinds 1/2) arrived'); ok = false; }
+    else if (out.frames < 10) { console.log('FAIL: only ' + out.frames + ' frames arrived'); ok = false; }
+    else if (!out.served || out.served.data !== stream || (mode !== 'mixed' && out.served.transport !== 'data') || (mode === 'mixed' && out.served.transport !== undefined)) { console.log('FAIL: served did not describe a ' + mode + ' session on stream ' + stream + ' (data + transport only when nothing else is served): ' + JSON.stringify(out.served)); ok = false; }
+    else if (!camDcUp) { console.log('FAIL: the camera\'s stats line never said dc=up: ' + JSON.stringify(out.stats)); ok = false; }
+    else if (out.initAfterAsk === null || out.keyframeAfterAsk === null) { console.log('FAIL: the keyframe request was not answered with an init and a keyframe (init ' + out.initAfterAsk + 'ms, keyframe ' + out.keyframeAfterAsk + 'ms)'); ok = false; }
+    else if (mode === 'mixed' && !(out.videoFrames > 0)) { console.log('FAIL: mixed offer: the channel ran but no video frames decoded on the track'); ok = false; }
+    else console.log(`PASS: ${mode} channel (id ${out.channelId}) open at ${out.openAt}ms, first message at ${out.firstAt}ms, ${out.frames} frames (${out.keyframes} key) at ${out.fps} fps / ${out.kbps} kbps, ${out.seqHoles} hole(s), ${out.gaps} camera-flagged gap(s), ${out.late} late, ${out.prft} with prft, ${out.multipart} part(s) of split messages, queue p95 ${out.queueMs.p95}ms; keyframe request answered by an init in ${out.initAfterAsk}ms and a keyframe in ${out.keyframeAfterAsk}ms`);
+    printStderr(/sctp|SCTP|dtls|DTLS|webrtc|WebRTC|ERROR/i);
   } else {
     throw new Error('unknown task ' + task);
   }
