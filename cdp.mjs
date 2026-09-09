@@ -33,7 +33,11 @@
 //                                    FORCE_SOFTWARE=1 makes the page's MSE
 //                                    refuse HEVC so the Live page walks to its
 //                                    software (WebAssembly) rung; the check is
-//                                    then that the rung painted its canvas
+//                                    then that the rung painted its canvas.
+//                                    WASM_BASE=<url> points the rung at a
+//                                    decoder build served elsewhere; FEED=
+//                                    datachannel|websocket pins how the
+//                                    buffered players take their bytes
 //   watch <url> [waitMs] [expr]      load a page and print what <expr>
 //                                    evaluates to once a second (a promise
 //                                    is awaited), for probing a page's own
@@ -364,6 +368,13 @@ async function main() {
         if (tp) { localStorage.setItem('mj-transport-pick', tp); localStorage.removeItem('mj-transport-auto'); localStorage.removeItem('mj-transport'); }
         if (st) { localStorage.setItem('mj-preview-stream:preview', st); localStorage.removeItem('mj-preview-stream'); }
       } catch (e) {}
+      // WASM_BASE: where the page fetches its software H.265 decoder from,
+      // for a build that is not on the CDN yet (a directory served from this
+      // host that the container can reach, e.g. http://172.17.0.1:8000/).
+      // FEED: 'datachannel' or 'websocket' to pin how the buffered players
+      // take their bytes, instead of the page's own choice.
+      if (${JSON.stringify(process.env.WASM_BASE || '')}) window.MJ_WASM_BASE = ${JSON.stringify(process.env.WASM_BASE || '')};
+      if (${JSON.stringify(process.env.FEED || '')}) window.MJ_FEED = ${JSON.stringify(process.env.FEED || '')};
       // FORCE_SOFTWARE: make the page's MSE refuse HEVC, so a Chrome that
       // decodes H.265 in hardware still walks down to the software rung
       // (the WebAssembly decoder), which is otherwise unreachable here.

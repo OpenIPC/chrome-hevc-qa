@@ -44,7 +44,7 @@ run() {  # run <args...>: docker run with the GPU, as the invoking user
         --user "$(id -u):$(id -g)" --security-opt seccomp=unconfined \
         -v "$here/clips:/work" -e HOME=/home/qa \
         ${CAMERA_USER:+-e CAMERA_USER -e CAMERA_PASS} \
-        ${MAX_REBUILDS:+-e MAX_REBUILDS} ${FORCE_SOFTWARE:+-e FORCE_SOFTWARE} \
+        ${MAX_REBUILDS:+-e MAX_REBUILDS} ${FORCE_SOFTWARE:+-e FORCE_SOFTWARE} ${WASM_BASE:+-e WASM_BASE} ${FEED:+-e FEED} \
         ${HEVC_VERBOSE:+-e HEVC_VERBOSE=1} ${DOCKER_EXTRA:-} "$image" "$@"
 }
 
