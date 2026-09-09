@@ -75,7 +75,7 @@
 // --no-sandbox (needed when running as root), CDP_ALL_STDERR=1 prints every
 // Chrome stderr line instead of the media-related ones.
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, writeSync } from 'node:fs';
 
 const [, , chrome, task, ...rest] = process.argv;
 const sep = rest.indexOf('--');
@@ -739,7 +739,15 @@ async function main() {
     res.pass = res.samples >= Math.max(3, (seconds - warmup) / 2) && res.framesPerTickOk && res.feedEvery && res.decoderEvery && res.visibleEvery && (res.camWs == null || res.camWs <= 1) && (res.camDc == null || res.camDc <= 1);
     res.reason = !res.samples ? 'no samples after warm-up' : !res.framesPerTickOk ? 'a tick with no frames' : !res.feedEvery ? 'feed was ' + JSON.stringify([...new Set(feeds)]) : !res.decoderEvery ? 'decoder was ' + JSON.stringify([...new Set(decoders)]) : !res.visibleEvery ? 'the tab was not visible throughout' : (res.camWs > 1 || res.camDc > 1) ? 'the camera counted more than one session' : 'ok';
     const json = JSON.stringify(res, null, 1);
-    console.log(json);
+    // Written synchronously and completely: the process exits right after,
+    // and a pipe takes one buffer of an asynchronous write by then — a run
+    // with its samples kept is larger than that, and a synchronous write
+    // to a full pipe is partial or refused until the reader drains it.
+    const bytes = Buffer.from(json + "\n");
+    for (let off = 0; off < bytes.length;) {
+      try { off += writeSync(1, bytes, off, bytes.length - off); }
+      catch (e) { if (e.code !== 'EAGAIN') throw e; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+    }
     if (process.env.BENCH_OUT) { try { writeFileSync(process.env.BENCH_OUT, json + '\n'); } catch (e) { console.log('FAIL: cannot write ' + process.env.BENCH_OUT + ': ' + e.message); ok = false; } }
     if (!res.pass) { console.log('FAIL: ' + res.reason); ok = false; }
     else console.log(`PASS: ${res.decoder} over ${res.feed} on stream ${res.stream}: ${res.frames} frames at ${res.fps} fps, lag p50 ${res.lag ? res.lag.p50 : '-'} p95 ${res.lag ? res.lag.p95 : '-'} ms, dropped ${res.dropped}, stalls ${res.stalls}, gaps ${res.camGaps}/${res.seqGaps}, rx ${res.rxKbps} kbps, rtt ${res.rttMs} ms`);
