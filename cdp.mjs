@@ -30,6 +30,14 @@
 //                                    frame counts and the camera's own
 //                                    consumer gauges; fails if one tab ever
 //                                    holds more than one /ws/video session
+//                                    FORCE_SOFTWARE=1 makes the page's MSE
+//                                    refuse HEVC so the Live page walks to its
+//                                    software (WebAssembly) rung; the check is
+//                                    then that the rung painted its canvas
+//   watch <url> [waitMs] [expr]      load a page and print what <expr>
+//                                    evaluates to once a second (a promise
+//                                    is awaited), for probing a page's own
+//                                    state while the camera is poked
 //
 // Environment: CAMERA_USER / CAMERA_PASS sign in to the camera's web
 // interface for http(s) urls (play and preview): a POST to /login from the
@@ -200,6 +208,27 @@ async function main() {
     console.log(out.text);
     if (!out.hevc) { console.log('FAIL: HEVC Main is not supported (no hardware decoder reachable)'); ok = false; }
     else console.log('PASS: HEVC Main supported');
+  } else if (task === 'eval') {
+    // eval <url> [waitMs]: load a page, wait for it to set window.__result,
+    // print that JSON. A generic escape hatch for one-off browser probes.
+    const url = taskArgs[0];
+    if (!url) throw new Error('eval needs a url');
+    const waitMs = +(taskArgs[1] || 8000);
+    listeners.push(m => {
+      if (m.sessionId === sid && m.method === 'Runtime.consoleAPICalled')
+        console.log('console.' + m.params.type + ': ' + m.params.args.map(a => a.value !== undefined ? String(a.value) : (a.description || a.type)).join(' ').slice(0, 400));
+    });
+    await navigate(sid, url);
+    const t0 = Date.now();
+    let out = null;
+    while (Date.now() - t0 < waitMs) {
+      const r = await evaluate(sid, 'window.__result ? JSON.stringify(window.__result) : null');
+      if (r) { out = r; break; }
+      await sleep(300);
+    }
+    if (out == null) { console.log('FAIL: window.__result never set within ' + waitMs + 'ms; title=' + JSON.stringify((await evaluate(sid, 'document.title')))); ok = false; }
+    else { console.log(out); const parsed = JSON.parse(out); if (parsed.verdict && /^BUG|NOT-REPRO|INCONCL/.test(parsed.verdict)) console.log('VERDICT: ' + parsed.verdict + ' | fix_ok=' + parsed.fix_ok); }
+    printStderr(/webgl|WebGL|GL_|gpu|GPU|Context|OffscreenCanvas|ANGLE|EGL/i);
   } else if (task === 'play') {
     const url = taskArgs[0];
     if (!url) throw new Error('play needs a url');
@@ -323,6 +352,13 @@ async function main() {
         if (tp) { localStorage.setItem('mj-transport-pick', tp); localStorage.removeItem('mj-transport-auto'); localStorage.removeItem('mj-transport'); }
         if (st) { localStorage.setItem('mj-preview-stream:preview', st); localStorage.removeItem('mj-preview-stream'); }
       } catch (e) {}
+      // FORCE_SOFTWARE: make the page's MSE refuse HEVC, so a Chrome that
+      // decodes H.265 in hardware still walks down to the software rung
+      // (the WebAssembly decoder), which is otherwise unreachable here.
+      if (${JSON.stringify(!!process.env.FORCE_SOFTWARE)}) {
+        const orig = MediaSource.isTypeSupported.bind(MediaSource);
+        MediaSource.isTypeSupported = (t) => (/hvc1|hev1/i.test(t) ? false : orig(t));
+      }
       window.__ws = [];
       const OrigWS = window.WebSocket;
       const HookedWS = function (u, p) {
@@ -364,6 +400,11 @@ async function main() {
                    waiting: v.__mj.waiting, seeking: v.__mj.seeking, loads: v.__mj.srcs,
                    err: v.error ? v.error.code : null };
         });
+        // The software rung paints a <canvas> from a worker; the only sign a
+        // frame landed is the flag the player sets on it.
+        const canvases = [...document.querySelectorAll('canvas')].filter(c => /^live-canvas/.test(c.id)).map(c => ({
+          id: c.id, shown: getComputedStyle(c).display !== 'none' && c.offsetParent !== null, painted: !!c.__mjPainted,
+          w: c.width, h: c.height }));
         const badge = document.querySelector('#mj-badge');
         let metrics = null;
         try {
@@ -372,7 +413,7 @@ async function main() {
           for (const k of ['ws_video_clients_total', 'webrtc_sessions_total', 'venc0_rcvd_bytes', 'venc1_rcvd_bytes'])
             { const r = new RegExp('^' + k + ' (\\\\S+)', 'm').exec(txt); if (r) metrics[k] = +r[1]; }
         } catch (e) { metrics = { error: String(e) }; }
-        return { t, sockets, videos, badge: badge && badge.textContent.trim(), metrics };
+        return { t, sockets, videos, canvases, badge: badge && badge.textContent.trim(), metrics };
       };` }, sid);
     if (!(await signIn(sid, url))) return false;
     await navigate(sid, url);
@@ -411,9 +452,11 @@ async function main() {
         rate = ` rx=${Math.round(rx)} enc=${Math.round(enc)} kbit/s${enc > 50 ? ' x' + (rx / enc).toFixed(2) : ''}`;
       }
       const inits = vid.reduce((n, x) => n + (x.inits || 0), 0);
+      const canvas = (s.canvases || []).find(c => c.shown);
       console.log(`t=${(s.t / 1000).toFixed(1)}s ws/video page open=${open} of ${vid.length} camera=${cam == null ? '?' : cam}` +
         ` webrtc=${s.metrics && s.metrics.webrtc_sessions_total}${rate} inits=${inits} | ` +
         (live ? `${live.id} ${live.w}x${live.h} frames=${live.total} dropped=${live.dropped} ahead=${live.ahead}s stalls=${live.waiting} seeks=${live.seeking} loads=${live.loads} rs=${live.rs}${live.err ? ' ERR' + live.err : ''}` : 'no video') +
+        (canvas ? ` | ${canvas.id} ${canvas.w}x${canvas.h} painted=${canvas.painted}` : '') +
         ` | ${s.badge || ''}`);
     }
     const last = samples[samples.length - 1];
@@ -436,11 +479,46 @@ async function main() {
     const live = last.videos.find(v => v.shown);
     const reloads = live ? (live.loads || 0) : 0;
     console.log(`summary: init segments seen=${initFrames}, visible-element rebuilds=${reloads}, stalls=${live ? live.waiting : '-'}`);
-    if (!live || !live.total) { console.log('FAIL: no video frames decoded on the visible element'); ok = false; }
+    const softCanvas = (last.canvases || []).find(c => c.shown);
+    if (process.env.FORCE_SOFTWARE) {
+      // The software rung's verdict: a canvas on screen that the decoder
+      // has painted, and the chip naming a measured H.265 rate.
+      if (!softCanvas || !softCanvas.painted) { console.log('FAIL: the software rung never painted its canvas' + (live && live.total ? ' (a <video> played instead)' : '')); ok = false; }
+      else if (maxPageOpen > 1 || maxCamera > 1) { console.log(`FAIL: one tab held ${maxPageOpen} open /ws/video sockets (camera counted ${maxCamera})`); ok = false; }
+      else console.log(`PASS: software rung painted ${softCanvas.w}x${softCanvas.h} on one /ws/video session; chip "${last.badge || ''}"`);
+    }
+    else if (!live || !live.total) { console.log('FAIL: no video frames decoded on the visible element'); ok = false; }
     else if (maxPageOpen > 1 || maxCamera > 1) { console.log(`FAIL: one tab held ${maxPageOpen} open /ws/video sockets (camera counted ${maxCamera})`); ok = false; }
     else if (reloads > MAX_REBUILDS) { console.log(`FAIL: the visible player rebuilt ${reloads} times (> ${MAX_REBUILDS}) -- /ws/video init re-emit resets the MSE decoder (majestic-webui#269/#335)`); ok = false; }
     else console.log(`PASS: one /ws/video session, ${live.total} frames, ${live.dropped} dropped (${(100 * live.dropped / live.total).toFixed(1)}%), ${reloads} rebuild(s), ${initFrames} init(s)`);
     printStderr(/vaapi|VA-API|decoder|Decoder|hevc|HEVC|h265|H265|GPU process|Context was lost|SharedImage/i);
+  } else if (task === 'watch') {
+    // watch <url> [waitMs] [expr]: load a page, then evaluate <expr> once a
+    // second and print what it returns -- a generic probe of a page's own
+    // state (an alert's hidden flag, a chip's text, a canvas's painted mark)
+    // while something is done to the camera from outside. <expr> may return a
+    // promise, so it can also fetch the camera's /metrics over the session
+    // cookie. Console lines are printed as they arrive, since the page's own
+    // complaints are usually the explanation of what the probe shows.
+    const url = taskArgs[0];
+    if (!url) throw new Error('watch needs a url');
+    const waitMs = +(taskArgs[1] || 20000);
+    const expr = taskArgs[2] || 'document.title';
+    listeners.push(m => {
+      if (m.sessionId === sid && m.method === 'Runtime.consoleAPICalled')
+        console.log('console.' + m.params.type + ': ' + m.params.args.map(a => a.value !== undefined ? String(a.value) : (a.description || a.type)).join(' ').slice(0, 300));
+    });
+    if (!(await signIn(sid, url))) return false;
+    await navigate(sid, url);
+    const t0 = Date.now();
+    while (Date.now() - t0 < waitMs) {
+      let r;
+      try {
+        r = await evaluate(sid, `(async function () { try { return JSON.stringify(await (${expr})); } catch (e) { return 'ERR ' + e; } })()`);
+      } catch (e) { r = 'EVAL-ERR ' + e.message; }
+      console.log('t=' + ((Date.now() - t0) / 1000).toFixed(1) + 's ' + r);
+      await sleep(1000);
+    }
   } else {
     throw new Error('unknown task ' + task);
   }
