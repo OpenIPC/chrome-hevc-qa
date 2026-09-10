@@ -24,6 +24,8 @@ with `/dev/dri/renderD128`, and nothing else.
 ./hevc-chrome play hevc_4k.mp4              # any clip in clips/, or an http(s) url
 CAMERA_USER=root CAMERA_PASS='...' ./hevc-chrome preview http://<camera>/cgi-bin/preview.cgi 15000 '#mj-stream-0' H265
 CAMERA_USER=root CAMERA_PASS='...' ./hevc-chrome live http://<camera>/cgi-bin/live.cgi 60000 mse 0   # Live page over MSE; catches /ws/video leaks and init-re-emit thrash
+CAMERA_USER=root CAMERA_PASS='...' ./hevc-chrome dc http://<camera>/ 16 1 [negotiated|dcep|mixed]     # the bitstream over an RTCDataChannel; probe in web/dc-probe.js
+CAMERA_USER=root CAMERA_PASS='...' ./hevc-chrome bench http://<camera>/cgi-bin/live.cgi 60 datachannel 1 mse  # one measured run of a feed; JSON + PASS/FAIL
 ./hevc-chrome tunnel <camera-host>          # only if the container has no route to the camera;
 ./hevc-chrome untunnel                      # then the url is http://172.17.0.1:18080/...
 ./hevc-chrome sysinfo        # only when something fails: Chrome's GPU view + stderr

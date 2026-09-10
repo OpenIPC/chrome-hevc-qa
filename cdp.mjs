@@ -33,11 +33,39 @@
 //                                    FORCE_SOFTWARE=1 makes the page's MSE
 //                                    refuse HEVC so the Live page walks to its
 //                                    software (WebAssembly) rung; the check is
-//                                    then that the rung painted its canvas
+//                                    then that the rung painted its canvas.
+//                                    WASM_BASE=<url> points the rung at a
+//                                    decoder build served elsewhere; FEED=
+//                                    datachannel|websocket pins how the
+//                                    buffered players take their bytes
 //   watch <url> [waitMs] [expr]      load a page and print what <expr>
 //                                    evaluates to once a second (a promise
 //                                    is awaited), for probing a page's own
 //                                    state while the camera is poked
+//   bench <url> [seconds] [feed] [stream] [decoder]
+//                                    one measured Live-page run over the
+//                                    buffered transport (mse, or the software
+//                                    rung with decoder=wasm) with the bytes
+//                                    carried by feed=datachannel|websocket:
+//                                    lag percentiles from the fragments'
+//                                    producer reference times, fps, drops,
+//                                    gaps, stalls, bit rate, round trip, as
+//                                    JSON (BENCH_OUT=file, BENCH_LABEL=name,
+//                                    BENCH_WARMUP_S=10, BENCH_SAMPLES=1 keeps
+//                                    the per-second samples); fails unless the
+//                                    requested feed and decoder held every
+//                                    tick with the tab visible
+//   dc <url> [seconds] [stream] [mode] the camera's video bitstream over an
+//                                    RTCDataChannel: offer a data-only
+//                                    PeerConnection on /ws/webrtc?stream=N,
+//                                    check every message's header and first
+//                                    box, ask for a keyframe halfway, report
+//                                    rates, holes, gaps and the camera's own
+//                                    dc= stats; fails on a declined section,
+//                                    a channel that never opens, a bad
+//                                    header, or an unanswered request;
+//                                    mode negotiated (default), dcep (an
+//                                    in-band open) or mixed (video beside it)
 //
 // Environment: CAMERA_USER / CAMERA_PASS sign in to the camera's web
 // interface for http(s) urls (play and preview): a POST to /login from the
@@ -47,6 +75,7 @@
 // --no-sandbox (needed when running as root), CDP_ALL_STDERR=1 prints every
 // Chrome stderr line instead of the media-related ones.
 import { spawn } from 'node:child_process';
+import { readFileSync, writeFileSync, writeSync } from 'node:fs';
 
 const [, , chrome, task, ...rest] = process.argv;
 const sep = rest.indexOf('--');
@@ -57,6 +86,7 @@ const flags = [
   ...(process.env.CDP_HEADLESS === '1' ? ['--headless=new'] : []),
   ...(process.env.CDP_NO_SANDBOX === '1' ? ['--no-sandbox'] : []),
   '--remote-debugging-pipe',
+  '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
   '--no-first-run', '--no-default-browser-check', '--disable-dev-shm-usage',
   '--user-data-dir=/tmp/cdp-profile-' + process.pid, '--crash-dumps-dir=/tmp',
   '--autoplay-policy=no-user-gesture-required',
@@ -111,7 +141,10 @@ async function evaluate(sid, expression) {
 // navigation commits destroys the execution context and the call never
 // returns, which looks exactly like a hung server.
 async function navigate(sid, url) {
-  const loaded = waitEvent('Page.loadEventFired', sid);
+  // Two minutes: a page behind a capped link, with its stream already
+  // taking most of it, can take a minute to load; a broken one fails the
+  // harness at two rather than the default half.
+  const loaded = waitEvent('Page.loadEventFired', sid, 120000);
   await send('Page.navigate', { url }, sid);
   await loaded;
 }
@@ -369,6 +402,13 @@ async function main() {
         if (tp) { localStorage.setItem('mj-transport-pick', tp); localStorage.removeItem('mj-transport-auto'); localStorage.removeItem('mj-transport'); }
         if (st) { localStorage.setItem('mj-preview-stream:preview', st); localStorage.removeItem('mj-preview-stream'); }
       } catch (e) {}
+      // WASM_BASE: where the page fetches its software H.265 decoder from,
+      // for a build that is not on the CDN yet (a directory served from this
+      // host that the container can reach, e.g. http://172.17.0.1:8000/).
+      // FEED: 'datachannel' or 'websocket' to pin how the buffered players
+      // take their bytes, instead of the page's own choice.
+      if (${JSON.stringify(process.env.WASM_BASE || '')}) window.MJ_WASM_BASE = ${JSON.stringify(process.env.WASM_BASE || '')};
+      if (${JSON.stringify(process.env.FEED || '')}) window.MJ_FEED = ${JSON.stringify(process.env.FEED || '')};
       // FORCE_SOFTWARE: make the page's MSE refuse HEVC, so a Chrome that
       // decodes H.265 in hardware still walks down to the software rung
       // (the WebAssembly decoder), which is otherwise unreachable here.
@@ -544,6 +584,205 @@ async function main() {
       await sleep(1000);
     }
     if (failures) { console.log('FAIL: ' + failures + ' evaluation(s) of the expression failed'); ok = false; }
+  } else if (task === 'dc') {
+    // dc <url> [seconds] [stream]: the camera's video bitstream over an
+    // RTCDataChannel. Signs in, offers a data-only PeerConnection over the
+    // camera's WebRTC signalling socket (/ws/webrtc?stream=N) with one
+    // pre-negotiated channel (id 0, unordered, no retransmits), and counts
+    // what arrives for <seconds>: every message is checked against the
+    // published header (magic 0xA5, version 1, kind, flags, part/parts, seq,
+    // queue delay) and its payload's first box. Halfway through it asks for
+    // a keyframe the way a page does, on the channel and on the signalling
+    // socket, and expects a fresh init segment with the next keyframe.
+    // Prints a JSON summary, the camera's own stats lines, and PASS/FAIL.
+    const url = taskArgs[0];
+    if (!url) throw new Error('dc needs a url');
+    const seconds = +(taskArgs[1] || 15);
+    const stream = +(taskArgs[2] || 0);
+    const mode = taskArgs[3] || 'negotiated';
+    // The probe is a page script shared with other browsers' checks; read
+    // here and evaluated on the camera's origin.
+    const probeSource = readFileSync(new URL('./web/dc-probe.js', import.meta.url), 'utf8');
+    listeners.push(m => {
+      if (m.sessionId === sid && m.method === 'Runtime.consoleAPICalled')
+        console.log('console.' + m.params.type + ': ' + m.params.args.map(a => a.value !== undefined ? String(a.value) : (a.description || a.type)).join(' ').slice(0, 300));
+    });
+    if (!(await signIn(sid, url))) return false;
+    // Stay on the camera's origin (the sign-in page carries no player, so
+    // the probe's session is the only one this tab opens).
+    const origin = new URL(url).origin;
+    if (!process.env.CAMERA_USER) await navigate(sid, origin + '/login.html');
+    const out = await evaluate(sid, `(async () => {
+      ${probeSource}
+      return window.__dcProbe(${seconds}, ${stream}, ${JSON.stringify(mode)});
+    })()`);
+    console.log(JSON.stringify(out, null, 1));
+    const camDcUp = out.stats.some(l => /\bdc=up\b/.test(l));
+    if (out.answerDeclined) { console.log('FAIL: the camera declined the data section (port 0) -- no data-channel support in this build'); ok = false; }
+    else if (!out.answerHasData) { console.log('FAIL: no answer with an application section; errors: ' + JSON.stringify(out.errors)); ok = false; }
+    else if (out.openAt === null) { console.log('FAIL: the channel never opened (ice ' + out.ice.join(' ') + '); errors: ' + JSON.stringify(out.errors)); ok = false; }
+    else if (out.bad || out.badBox) { console.log(`FAIL: ${out.bad} message(s) with a bad header, ${out.badBox} with a wrong first box`); ok = false; }
+    else if (out.kinds.init < 1 || out.kinds.initSeg < 1) { console.log('FAIL: no init messages (kinds 1/2) arrived'); ok = false; }
+    else if (out.frames < 10) { console.log('FAIL: only ' + out.frames + ' frames arrived'); ok = false; }
+    else if (!out.served || out.served.data !== stream || (mode !== 'mixed' && out.served.transport !== 'data') || (mode === 'mixed' && out.served.transport !== undefined)) { console.log('FAIL: served did not describe a ' + mode + ' session on stream ' + stream + ' (data + transport only when nothing else is served): ' + JSON.stringify(out.served)); ok = false; }
+    else if (!camDcUp) { console.log('FAIL: the camera\'s stats line never said dc=up: ' + JSON.stringify(out.stats)); ok = false; }
+    else if (out.initAfterAsk === null || out.keyframeAfterAsk === null) { console.log('FAIL: the keyframe request was not answered with an init and a keyframe (init ' + out.initAfterAsk + 'ms, keyframe ' + out.keyframeAfterAsk + 'ms)'); ok = false; }
+    else if (mode === 'mixed' && !(out.videoFrames > 0)) { console.log('FAIL: mixed offer: the channel ran but no video frames decoded on the track'); ok = false; }
+    else console.log(`PASS: ${mode} channel (id ${out.channelId}) open at ${out.openAt}ms, first message at ${out.firstAt}ms, ${out.frames} frames (${out.keyframes} key) at ${out.fps} fps / ${out.kbps} kbps, ${out.seqHoles} hole(s), ${out.gaps} camera-flagged gap(s), ${out.late} late, ${out.prft} with prft, ${out.multipart} part(s) of split messages, queue p95 ${out.queueMs.p95}ms; keyframe request answered by an init in ${out.initAfterAsk}ms and a keyframe in ${out.keyframeAfterAsk}ms`);
+    printStderr(/sctp|SCTP|dtls|DTLS|webrtc|WebRTC|ERROR/i);
+  } else if (task === 'bench') {
+    // bench <url> [seconds] [feed] [stream] [decoder]: one measured run of
+    // the Live page over the buffered transport — the MSE player, or with
+    // decoder=wasm the software rung — with the bytes carried by the feed
+    // named (datachannel|websocket), pinned through the page's own hooks.
+    // Samples the players' per-second stats (teed off the page's onStats
+    // callbacks, not read off the panel) and the page's visibility once a
+    // second; after BENCH_WARMUP_S seconds the rest is aggregated: lag
+    // percentiles from the raw capture-to-arrival samples the fragments'
+    // producer reference times give, frame rate, drops, gaps, stalls,
+    // reconnects, the camera-side queue, the received bit rate, the round
+    // trip. PASS needs frames on every tick, the requested decoder and feed
+    // on every tick, the tab visible throughout and at most one /ws/video
+    // socket at a time. The JSON goes to stdout and, with BENCH_OUT, to a
+    // file; BENCH_LABEL names the run inside it. Chrome runs with its
+    // background throttling off so a covered window cannot skew a run.
+    const url = taskArgs[0];
+    if (!url) throw new Error('bench needs a url');
+    const seconds = +(taskArgs[1] || 50);
+    const feedWant = taskArgs[2] || 'datachannel';
+    const stream = taskArgs[3] || '0';
+    const decoder = taskArgs[4] || 'mse';
+    const warmup = +(process.env.BENCH_WARMUP_S || 10);
+    const label = process.env.BENCH_LABEL || '';
+    const consoleLines = [];
+    listeners.push(m => {
+      if (m.sessionId !== sid) return;
+      if (m.method === 'Runtime.consoleAPICalled')
+        consoleLines.push(m.params.type + ': ' + m.params.args.map(a => a.value !== undefined ? String(a.value) : (a.description || a.type)).join(' ').slice(0, 200));
+    });
+    await send('Page.addScriptToEvaluateOnNewDocument', { source: `
+      try {
+        localStorage.setItem('mj-transport-pick', 'mse'); localStorage.removeItem('mj-transport-auto'); localStorage.removeItem('mj-transport');
+        localStorage.setItem('mj-preview-stream:preview', ${JSON.stringify(String(stream))}); localStorage.removeItem('mj-preview-stream');
+        localStorage.removeItem('mj-feed-auto');
+      } catch (e) {}
+      window.MJ_FEED = ${JSON.stringify(feedWant)};
+      if (${JSON.stringify(process.env.WASM_BASE || '')}) window.MJ_WASM_BASE = ${JSON.stringify(process.env.WASM_BASE || '')};
+      // BENCH_ICE: a JSON iceServers list the page uses instead of the
+      // camera's — a relay on this side, for the cells where only a relay
+      // can carry the session.
+      if (${JSON.stringify(process.env.BENCH_ICE || '')}) { try { window.MJ_ICE = JSON.parse(${JSON.stringify(process.env.BENCH_ICE || '')}); } catch (e) {} }
+      if (${JSON.stringify(decoder === 'wasm')}) {
+        const orig = MediaSource.isTypeSupported.bind(MediaSource);
+        MediaSource.isTypeSupported = (t) => (/hvc1|hev1/i.test(t) ? false : orig(t));
+      }
+      // Tee every player's per-second stats. The players are globals the
+      // page's scripts assign later; an accessor installed now wraps attach()
+      // on assignment so opts.onStats is observed without the page knowing.
+      window.__mjBench = { samples: [], t0: Date.now() };
+      for (const name of ['MajesticVideo', 'MajesticWasm']) {
+        let real;
+        Object.defineProperty(window, name, {
+          configurable: true, enumerable: true,
+          get() { return real; },
+          set(v) {
+            real = v;
+            if (!v || typeof v.attach !== 'function') return;
+            const attach = v.attach;
+            v.attach = function (el, opts) {
+              opts = Object.assign({}, opts || {});
+              const inner = opts.onStats;
+              opts.onStats = (s) => {
+                try { window.__mjBench.samples.push(Object.assign({ at: Date.now(), player: name, visible: document.visibilityState }, s)); } catch (e) {}
+                if (inner) inner(s);
+              };
+              return attach.call(this, el, opts);
+            };
+          },
+        });
+      }
+    ` }, sid);
+    if (!(await signIn(sid, url))) return false;
+    await navigate(sid, url);
+    await send('Page.bringToFront', {}, sid);
+    const t0 = Date.now();
+    let camCount = [];
+    let ticks = 0;
+    while (Date.now() - t0 < seconds * 1000) {
+      await sleep(1000);
+      // The camera's own socket count, so a leaked session shows up as a
+      // count of two whether or not the page noticed. Every five seconds:
+      // the metrics page is tens of kilobytes, and it shares the link
+      // under test with the picture.
+      if (ticks++ % 5 !== 0) continue;
+      try {
+        const r = await evaluate(sid, `fetch('/metrics', { credentials: 'same-origin' }).then(r => r.text()).then(t => { const m = /^ws_video_clients_total (\\d+)/m.exec(t); const d = /^webrtc_data_sessions (\\d+)/m.exec(t); return { ws: m ? +m[1] : null, dc: d ? +d[1] : null }; }).catch(() => null)`);
+        if (r) camCount.push(r);
+      } catch (e) {}
+    }
+    const out = await evaluate(sid, `(function () {
+      const b = window.__mjBench || { samples: [] };
+      const wsOpen = Array.from(document.querySelectorAll('*')).length && 0;
+      return { samples: b.samples, t0: b.t0, socketsNow: 0 };
+    })()`);
+    const all = out.samples || [];
+    const cut = t0 + warmup * 1000;
+    const kept = all.filter(s => s.at >= cut);
+    const pct = (a, p) => { if (!a.length) return null; const b = a.slice().sort((x, y) => x - y); return b[Math.min(b.length - 1, Math.floor(p * b.length))]; };
+    const lag = [];
+    kept.forEach(s => { if (Array.isArray(s.lagMs)) lag.push(...s.lagMs); });
+    const first = kept[0], last = kept[kept.length - 1];
+    const delta = (k) => (last && first && typeof last[k] === 'number' && typeof first[k] === 'number') ? last[k] - first[k] : null;
+    const durS = kept.length > 1 ? (last.at - first.at) / 1000 : 0;
+    const frames = kept.map(s => s.totalFrames != null ? s.totalFrames : s.framesDecoded).filter(v => typeof v === 'number');
+    const fps = frames.length > 1 && durS > 0 ? (frames[frames.length - 1] - frames[0]) / durS : null;
+    const rtts = kept.map(s => s.dc && s.dc.rttMs).filter(v => typeof v === 'number');
+    const queued = kept.map(s => s.dc && s.dc.queueMs).filter(v => typeof v === 'number');
+    const rx = delta('rxBytes');
+    const feeds = kept.map(s => s.feed), decoders = kept.map(s => s.transport);
+    const wantDecoder = decoder === 'wasm' ? 'wasm' : 'mse';
+    const res = {
+      label, url, feed: feedWant, stream: +stream, decoder: wantDecoder, seconds, warmupS: warmup,
+      samples: kept.length, framesPerTickOk: kept.length > 0 && kept.every(s => (s.totalFrames || s.framesDecoded || 0) > 0),
+      feedEvery: kept.length > 0 && feeds.every(f => f === feedWant),
+      decoderEvery: kept.length > 0 && decoders.every(d => d === wantDecoder),
+      visibleEvery: kept.length > 0 && kept.every(s => s.visible === 'visible'),
+      lag: lag.length ? { n: lag.length, p50: pct(lag, 0.5), p95: pct(lag, 0.95), p99: pct(lag, 0.99), max: pct(lag, 1) } : null,
+      fps: fps != null ? +fps.toFixed(2) : null,
+      frames: frames.length > 1 ? frames[frames.length - 1] - frames[0] : null,
+      dropped: delta('droppedFrames') != null ? delta('droppedFrames') : delta('framesDropped'),
+      gopDrops: delta('gopDrops'), idrRequests: delta('idrRequests'), stalls: delta('stalls'), discarded: delta('discarded'),
+      bufferedMsP95: pct(kept.map(s => s.bufferedMs).filter(v => typeof v === 'number'), 0.95),
+      queuedMsP95: pct(kept.map(s => s.queuedMs).filter(v => typeof v === 'number'), 0.95),
+      camQueueMsP95: queued.length ? pct(queued, 0.95) : null,
+      seqGaps: last && last.dc ? last.dc.seqGaps : null, camGaps: last && last.dc ? last.dc.camGaps : null, late: last && last.dc ? last.dc.late : null,
+      rxKbps: rx != null && durS > 0 ? Math.round(rx * 8 / 1000 / durS) : null,
+      rttMs: rtts.length ? pct(rtts, 0.5) : null,
+      camLine: last && last.dc && last.dc.cam ? last.dc.cam : null,
+      camWs: camCount.length ? Math.max(...camCount.map(c => c.ws || 0)) : null,
+      camDc: camCount.length ? Math.max(...camCount.map(c => c.dc || 0)) : null,
+      console: consoleLines.slice(0, 8),
+    };
+    // BENCH_SAMPLES=1 keeps the per-second samples themselves (minus the raw
+    // lag arrays), so a run's shape — when a gap came, how long the picture
+    // waited for a keyframe, what the camera's counters did — can be read
+    // back instead of inferred from the totals.
+    if (process.env.BENCH_SAMPLES) res.timeline = kept.map(s => { const o = Object.assign({}, s); delete o.lagMs; o.t = +((s.at - t0) / 1000).toFixed(1); delete o.at; return o; });
+    res.pass = res.samples >= Math.max(3, (seconds - warmup) / 2) && res.framesPerTickOk && res.feedEvery && res.decoderEvery && res.visibleEvery && (res.camWs == null || res.camWs <= 1) && (res.camDc == null || res.camDc <= 1);
+    res.reason = !res.samples ? 'no samples after warm-up' : !res.framesPerTickOk ? 'a tick with no frames' : !res.feedEvery ? 'feed was ' + JSON.stringify([...new Set(feeds)]) : !res.decoderEvery ? 'decoder was ' + JSON.stringify([...new Set(decoders)]) : !res.visibleEvery ? 'the tab was not visible throughout' : (res.camWs > 1 || res.camDc > 1) ? 'the camera counted more than one session' : 'ok';
+    const json = JSON.stringify(res, null, 1);
+    // Written synchronously and completely: the process exits right after,
+    // and a pipe takes one buffer of an asynchronous write by then — a run
+    // with its samples kept is larger than that, and a synchronous write
+    // to a full pipe is partial or refused until the reader drains it.
+    const bytes = Buffer.from(json + "\n");
+    for (let off = 0; off < bytes.length;) {
+      try { off += writeSync(1, bytes, off, bytes.length - off); }
+      catch (e) { if (e.code !== 'EAGAIN') throw e; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+    }
+    if (process.env.BENCH_OUT) { try { writeFileSync(process.env.BENCH_OUT, json + '\n'); } catch (e) { console.log('FAIL: cannot write ' + process.env.BENCH_OUT + ': ' + e.message); ok = false; } }
+    if (!res.pass) { console.log('FAIL: ' + res.reason); ok = false; }
+    else console.log(`PASS: ${res.decoder} over ${res.feed} on stream ${res.stream}: ${res.frames} frames at ${res.fps} fps, lag p50 ${res.lag ? res.lag.p50 : '-'} p95 ${res.lag ? res.lag.p95 : '-'} ms, dropped ${res.dropped}, stalls ${res.stalls}, gaps ${res.camGaps}/${res.seqGaps}, rx ${res.rxKbps} kbps, rtt ${res.rttMs} ms`);
   } else {
     throw new Error('unknown task ' + task);
   }
