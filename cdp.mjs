@@ -130,7 +130,7 @@ async function signIn(sid, url) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ username: ${JSON.stringify(user)}, password: ${JSON.stringify(process.env.CAMERA_PASS || '')} }).toString() })
     .then(r => r.status, () => -1)`);
-  console.log('sign-in as ' + user + ' at ' + origin + ': HTTP ' + status);
+  console.log('sign-in at ' + origin + ': HTTP ' + status);
   if (status === 200) return true;
   console.log('FAIL: sign-in refused (HTTP ' + status + ')');
   return false;
@@ -218,16 +218,26 @@ async function main() {
       if (m.sessionId === sid && m.method === 'Runtime.consoleAPICalled')
         console.log('console.' + m.params.type + ': ' + m.params.args.map(a => a.value !== undefined ? String(a.value) : (a.description || a.type)).join(' ').slice(0, 400));
     });
+    if (!(await signIn(sid, url))) return false;
     await navigate(sid, url);
     const t0 = Date.now();
     let out = null;
     while (Date.now() - t0 < waitMs) {
-      const r = await evaluate(sid, 'window.__result ? JSON.stringify(window.__result) : null');
-      if (r) { out = r; break; }
+      // A result of false, 0 or '' is a result: only an unset slot keeps polling.
+      const r = await evaluate(sid, "'__result' in window && window.__result !== undefined ? JSON.stringify(window.__result) : null");
+      if (r != null) { out = r; break; }
       await sleep(300);
     }
     if (out == null) { console.log('FAIL: window.__result never set within ' + waitMs + 'ms; title=' + JSON.stringify((await evaluate(sid, 'document.title')))); ok = false; }
-    else { console.log(out); const parsed = JSON.parse(out); if (parsed.verdict && /^BUG|NOT-REPRO|INCONCL/.test(parsed.verdict)) console.log('VERDICT: ' + parsed.verdict + ' | fix_ok=' + parsed.fix_ok); }
+    else {
+      console.log(out);
+      // The page's verdict is the driver's: a reproduced bug or an
+      // inconclusive probe is a failed check, not a line to read.
+      const parsed = JSON.parse(out);
+      const verdict = parsed && parsed.verdict;
+      if (verdict && /^(BUG|INCONCL)/.test(verdict)) { console.log('FAIL: verdict ' + verdict + ' | fix_ok=' + parsed.fix_ok); ok = false; }
+      else if (verdict) console.log('VERDICT: ' + verdict + ' | fix_ok=' + parsed.fix_ok);
+    }
     printStderr(/webgl|WebGL|GL_|gpu|GPU|Context|OffscreenCanvas|ANGLE|EGL/i);
   } else if (task === 'play') {
     const url = taskArgs[0];
@@ -333,6 +343,13 @@ async function main() {
     const waitMs = Math.max(3000, +(taskArgs[1]) || 30000);  // never 0: an empty run has no `last` sample
     const transport = taskArgs[2] || '';
     const stream = taskArgs[3] || '';
+    if (process.env.FORCE_SOFTWARE && transport && transport !== 'mse') {
+      // The software rung is where the MSE player falls when its codec is
+      // refused; a WebRTC run has no such rung to paint, and the verdict
+      // below would fail a stream that played perfectly.
+      console.log('FAIL: FORCE_SOFTWARE applies to the mse transport, not ' + transport);
+      return false;
+    }
     // How many in-place MediaSource rebuilds the visible player may make
     // before the run is judged a re-init thrash. One initial load is normal;
     // a couple more tolerate a reconnect. Dozens is the flash. Override with
@@ -511,14 +528,22 @@ async function main() {
     if (!(await signIn(sid, url))) return false;
     await navigate(sid, url);
     const t0 = Date.now();
+    let failures = 0;
     while (Date.now() - t0 < waitMs) {
-      let r;
+      // One JSON object per line: the elapsed time and either the
+      // expression's value or the error it threw (in the page, or in the
+      // DevTools call itself).
+      const t = +((Date.now() - t0) / 1000).toFixed(1);
+      let line;
       try {
-        r = await evaluate(sid, `(async function () { try { return JSON.stringify(await (${expr})); } catch (e) { return 'ERR ' + e; } })()`);
-      } catch (e) { r = 'EVAL-ERR ' + e.message; }
-      console.log('t=' + ((Date.now() - t0) / 1000).toFixed(1) + 's ' + r);
+        const r = await evaluate(sid, `(async function () { try { return JSON.stringify({ result: await (${expr}) }); } catch (e) { return JSON.stringify({ error: String(e) }); } })()`);
+        line = typeof r === 'string' ? r : JSON.stringify({ result: r });
+      } catch (e) { line = JSON.stringify({ error: 'evaluate: ' + e.message }); }
+      if (line.startsWith('{"error"')) failures++;
+      console.log('{"t":' + t + ',' + line.slice(1));
       await sleep(1000);
     }
+    if (failures) { console.log('FAIL: ' + failures + ' evaluation(s) of the expression failed'); ok = false; }
   } else {
     throw new Error('unknown task ' + task);
   }
