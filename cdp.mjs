@@ -682,10 +682,14 @@ async function main() {
     await send('Page.bringToFront', {}, sid);
     const t0 = Date.now();
     let camCount = [];
+    let ticks = 0;
     while (Date.now() - t0 < seconds * 1000) {
       await sleep(1000);
       // The camera's own socket count, so a leaked session shows up as a
-      // count of two whether or not the page noticed.
+      // count of two whether or not the page noticed. Every five seconds:
+      // the metrics page is tens of kilobytes, and it shares the link
+      // under test with the picture.
+      if (ticks++ % 5 !== 0) continue;
       try {
         const r = await evaluate(sid, `fetch('/metrics', { credentials: 'same-origin' }).then(r => r.text()).then(t => { const m = /^ws_video_clients_total (\\d+)/m.exec(t); const d = /^webrtc_data_sessions (\\d+)/m.exec(t); return { ws: m ? +m[1] : null, dc: d ? +d[1] : null }; }).catch(() => null)`);
         if (r) camCount.push(r);
