@@ -9,6 +9,7 @@
 #   ./hevc-chrome caps                      codec support probes (pass/fail)
 #   ./hevc-chrome play <clip|url> [offscreen]
 #   ./hevc-chrome preview <url> [waitMs] [clickSelector] [expectCodec]
+#   ./hevc-chrome shot <url> <out.png> [waitMs] [selector]   PNG into shots/
 #   ./hevc-chrome selfcheck                 vainfo + caps + 4K HEVC playback
 #   ./hevc-chrome tunnel <camera-host> [port]   ssh -L to a camera's web port (no direct route)
 #   ./hevc-chrome untunnel [port]
@@ -65,6 +66,16 @@ case "$cmd" in
         run /opt/make-clips.sh ;;
     sysinfo|caps|preview|live|eval|watch|dc|bench)
         run chrome "$cmd" "$@" ;;
+    shot)
+        # The output lands in shots/ on the host, named by the second
+        # argument's basename: the container only ever writes to a directory
+        # this mounts, so a path outside it would silently vanish with the
+        # container.
+        [ $# -ge 2 ] || { echo "shot needs a url and an output filename" >&2; exit 2; }
+        url=$1; out=$(basename "$2"); shift 2
+        mkdir -p "$here/shots"
+        DOCKER_EXTRA="${DOCKER_EXTRA:-} -v $here/shots:/shots" run chrome shot "$url" "/shots/$out" "$@"
+        echo "on the host: $here/shots/$out" ;;
     play)
         [ $# -ge 1 ] || { echo "play needs a clip name or url" >&2; exit 2; }
         url=$(clip_url "$1") || exit 2; shift
