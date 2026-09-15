@@ -10,6 +10,11 @@
 //   caps                             codec support probes (<video>, MSE,
 //                                    mediaCapabilities, WebRTC receive/send);
 //                                    fails unless HEVC Main is supported
+//   shot <url> <out.png> [waitMs] [selector]
+//                                    sign in, load, wait, save a PNG; with a
+//                                    selector, clipped to that element. For
+//                                    the pages whose verdict is what they
+//                                    look like
 //   play <url> [offscreen]           play a video, report decoded size and
 //                                    frame counts; fails on a media error or
 //                                    fewer than MIN_FRAMES (env, default 10)
@@ -95,7 +100,7 @@ const flags = [
 ];
 
 if (!chrome || !task) {
-  console.error('usage: node cdp.mjs <chrome> <sysinfo|caps|play|preview> [args] [-- chrome flags]');
+  console.error('usage: node cdp.mjs <chrome> <sysinfo|caps|shot|play|preview> [args] [-- chrome flags]');
   process.exit(2);
 }
 
@@ -272,6 +277,41 @@ async function main() {
       else if (verdict) console.log('VERDICT: ' + verdict + ' | fix_ok=' + parsed.fix_ok);
     }
     printStderr(/webgl|WebGL|GL_|gpu|GPU|Context|OffscreenCanvas|ANGLE|EGL/i);
+  } else if (task === 'shot') {
+    // shot <url> <out.png> [waitMs] [selector]: sign in, load, wait, save a
+    // PNG. The escape hatch `eval` is for a page that can state its own
+    // verdict; this is for the ones whose verdict is what they look like — a
+    // lane, a chart, a layout. With a selector the shot is clipped to that
+    // element's box, which is what makes a 30 KB image of the thing under
+    // test rather than a 2 MB image of a page containing it.
+    const url = taskArgs[0];
+    const out = taskArgs[1];
+    if (!url || !out) throw new Error('shot needs a url and an output path');
+    const waitMs = +(taskArgs[2] || 6000);
+    const selector = taskArgs[3] || '';
+    if (!(await signIn(sid, url))) return false;
+    await navigate(sid, url);
+    await sleep(waitMs);
+
+    let clip;
+    if (selector) {
+      const box = await evaluate(sid,
+        "(() => { const e = document.querySelector(" + JSON.stringify(selector) + ");" +
+        " if (!e) return null; const r = e.getBoundingClientRect();" +
+        " return JSON.stringify({x: r.x + scrollX, y: r.y + scrollY, width: r.width, height: r.height}); })()");
+      if (!box) { console.log('FAIL: no element matches ' + selector); return false; }
+      const b = JSON.parse(box);
+      if (!b.width || !b.height) { console.log('FAIL: ' + selector + ' has no box (' + b.width + 'x' + b.height + ')'); return false; }
+      // captureBeyondViewport so an element below the fold is rendered rather
+      // than returned blank.
+      clip = {x: b.x, y: b.y, width: b.width, height: b.height, scale: 2};
+    }
+
+    const shot = await send('Page.captureScreenshot',
+      clip ? {format: 'png', clip, captureBeyondViewport: true} : {format: 'png'}, sid);
+    writeFileSync(out, Buffer.from(shot.data, 'base64'));
+    console.log('wrote ' + out + ' (' + Math.round(Buffer.from(shot.data, 'base64').length / 1024) + ' KB)'
+      + (selector ? ' clipped to ' + selector : ''));
   } else if (task === 'play') {
     const url = taskArgs[0];
     if (!url) throw new Error('play needs a url');

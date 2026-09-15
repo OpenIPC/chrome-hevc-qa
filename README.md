@@ -50,6 +50,7 @@ breaks, in order, so a failure names the stage.
 | `./hevc-chrome clips` | generate `clips/`: `hevc_1080p`, `hevc_4k`, `hevc_main10` and the `h264_1080p` control |
 | `./hevc-chrome sysinfo` | Chrome's own view of the GPU: PCI ids, feature status, ANGLE backend, VA-API log lines |
 | `./hevc-chrome caps` | codec support table (`canPlayType`, MSE, mediaCapabilities, WebRTC receive/send); fails unless HEVC Main is supported |
+| `./hevc-chrome shot <url> <out.png> [waitMs] [selector]` | sign in, load the page, wait, save a PNG into `shots/`; with a CSS selector the image is clipped to that element. For the pages whose verdict is what they look like — a lane, a chart, a layout — rather than something they can state |
 | `./hevc-chrome play <clip\|url> [offscreen]` | play a video, report decoded size, frames decoded and dropped; fails on a media error or under `MIN_FRAMES` (default 10) |
 | `./hevc-chrome preview <url> [waitMs] [clickSelector] [expectCodec]` | load a page that opens its own WebRTC session, report what it negotiated and decoded |
 | `./hevc-chrome live <url> [waitMs] [transport] [stream]` | load the WebUI Live page over MSE (or WebRTC), sample every socket and the visible `<video>` once a second; fails on >1 `/ws/video` session per tab or on repeated MediaSource rebuilds (init re-emit thrash) |
