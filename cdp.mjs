@@ -423,8 +423,11 @@ async function main() {
     // the page's main thread N times; MOTION_CSS=overlay-hidden,
     // no-transition, regions-hidden (comma list) switches parts of the tab
     // off, to bisect. Fails when the tab plays worse than Live by more than
-    // MOTION_FPS_PCT (15) % fps, MOTION_DROP_X (2) times the drops plus 5, or
-    // MOTION_DELAY_MS (150) ms of extra picture delay.
+    // MOTION_FPS_PCT (15) % fps, MOTION_DROP_X (2) times the drops plus 5,
+    // MOTION_DELAY_MS (150) ms of extra picture delay, or more than
+    // MOTION_STALL_S (1) extra seconds under half the control's rate (or extra
+    // freezes). A run that did not measure what it claims -- no frames, the
+    // wrong player, no detections, a refused flip -- fails as invalid.
     const url = taskArgs[0];
     if (!url) throw new Error('motion needs a camera url');
     const origin = new URL(url).origin;
@@ -486,11 +489,17 @@ async function main() {
       const feed = ${JSON.stringify(feed)}, BOXES = ${boxes}, RATE = ${rate};
       const OrigWS = window.WebSocket;
       const fake = (u) => {
+        // Delivers through the on* handlers AND addEventListener, as a real
+        // socket does, so the page is fed whichever way it subscribes.
+        const ls = { open: [], message: [], close: [], error: [] };
+        const fire = (type, ev) => { if (s['on' + type]) s['on' + type](ev); for (const f of ls[type].slice()) f(ev); };
         const s = { url: u, readyState: 0, onopen: null, onmessage: null, onclose: null, onerror: null,
-                    send() {}, addEventListener() {}, removeEventListener() {},
-                    close() { if (s.readyState === 3) return; s.readyState = 3; clearInterval(s.t); if (s.onclose) s.onclose({ code: 1000 }); } };
+                    send() {},
+                    addEventListener(t, f) { if (ls[t] && typeof f === 'function' && !ls[t].includes(f)) ls[t].push(f); },
+                    removeEventListener(t, f) { if (ls[t]) ls[t] = ls[t].filter(g => g !== f); },
+                    close() { if (s.readyState === 3) return; s.readyState = 3; clearInterval(s.t); fire('close', { code: 1000 }); } };
         setTimeout(() => {
-          s.readyState = 1; if (s.onopen) s.onopen({});
+          s.readyState = 1; window.__m.anOpened = true; fire('open', {});
           if (feed !== 'synthetic') return;
           let n = 0;
           s.t = setInterval(() => {
@@ -502,7 +511,7 @@ async function main() {
             }
             const data = JSON.stringify({ src: 'motion', active: true, w: W, h: H, n: BOXES, total: BOXES, r });
             window.__m.an++; window.__m.anBytes += data.length;
-            if (s.onmessage) s.onmessage({ data });
+            fire('message', { data });
           }, 1000 / RATE);
         }, 30);
         return s;
@@ -510,8 +519,10 @@ async function main() {
       const WS = function (u, p) {
         if (/\\/ws\\/analytics/.test(String(u)) && feed !== 'camera') return fake(String(u));
         const s = p === undefined ? new OrigWS(u) : new OrigWS(u, p);
-        if (/\\/ws\\/analytics/.test(String(u)))
+        if (/\\/ws\\/analytics/.test(String(u))) {
+          s.addEventListener('open', () => { window.__m.anOpened = true; });
           s.addEventListener('message', e => { window.__m.an++; window.__m.anBytes += (e.data && e.data.length) || 0; });
+        }
         return s;
       };
       WS.prototype = OrigWS.prototype; Object.setPrototypeOf(WS, OrigWS);
@@ -529,7 +540,7 @@ async function main() {
     // One reading of everything, cumulative; the window is the difference.
     const SAMPLE = `(async () => {
       const m = window.__m || {};
-      const out = { t: performance.now(), raf: m.raf, lt: m.lt, ltMs: m.ltMs, ltMax: m.ltMax, an: m.an, anBytes: m.anBytes,
+      const out = { t: performance.now(), anOpened: !!m.anOpened, raf: m.raf, lt: m.lt, ltMs: m.ltMs, ltMax: m.ltMax, an: m.an, anBytes: m.anBytes,
                     boxes: document.querySelectorAll('.mj-an-box').length, player: null };
       for (const pc of (m.pcs || [])) {
         if (pc.connectionState === 'closed') continue;
@@ -539,7 +550,11 @@ async function main() {
           freezes: s.freezeCount || 0, freezeS: s.totalFreezesDuration || 0,
           jbd: s.jitterBufferDelay || 0, jbe: s.jitterBufferEmittedCount || 0 }); });
       }
-      if (!out.player && m.wasm) Object.assign(out, { player: 'wasm', frames: m.wasm.framesDecoded, dropped: m.wasm.framesDropped || 0 });
+      // Both spellings, as bench reads them: the rung's stats have carried
+      // totalFrames/droppedFrames as well as framesDecoded/framesDropped.
+      if (!out.player && m.wasm) Object.assign(out, { player: 'wasm',
+        frames: m.wasm.totalFrames != null ? m.wasm.totalFrames : m.wasm.framesDecoded,
+        dropped: (m.wasm.droppedFrames != null ? m.wasm.droppedFrames : m.wasm.framesDropped) || 0 });
       if (!out.player) {
         const v = [...document.querySelectorAll('video')].filter(v => v.videoWidth && v.getBoundingClientRect().width)
           .sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
@@ -559,7 +574,7 @@ async function main() {
     const perf = async () => Object.fromEntries((await send('Performance.getMetrics', {}, sid)).metrics.map(x => [x.name, x.value]));
 
     // The camera feed's mover, and the values it has to put back.
-    let saved = null, flip = 0;
+    let saved = null, flip = 0, refused = 0, lastRefusal = null;
     const live = (img) => evaluate(sid, `fetch('/api/v1/live', { method: 'POST', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' }, body: ${JSON.stringify(JSON.stringify({ image: img }))} })
       .then(r => r.status, () => -1)`);
@@ -567,7 +582,10 @@ async function main() {
       if (feed !== 'camera' || !saved) return;
       flip ^= 1;
       const v = flip ? 10 : 90;
-      await live(Object.assign({}, saved, { contrast: v, luminance: v }));
+      // Checked every time: a refused flip is a second the picture did not
+      // move, and a run built on those has measured a static scene.
+      const st = await live(Object.assign({}, saved, { contrast: v, luminance: v }));
+      if (st !== 200) { refused++; lastRefusal = st; }
     };
 
     const results = {};
@@ -581,6 +599,7 @@ async function main() {
         for (let i = 0; i < warmup; i++) { await move(); await sleep(1000); }
         const a = await evaluate(sid, SAMPLE), pa = await perf();
         const per = [];
+        const players = new Set([a.player]);
         let prev = a;
         for (let i = 0; i < seconds; i++) {
           const t = Date.now();
@@ -591,6 +610,7 @@ async function main() {
           per.push({ fps: prev.frames != null && b.frames != null ? +((b.frames - prev.frames) / dt).toFixed(1) : null,
                      drop: b.dropped != null && prev.dropped != null ? b.dropped - prev.dropped : null,
                      lt: b.lt - prev.lt, an: b.an - prev.an, boxes: b.boxes });
+          players.add(b.player);
           prev = b;
         }
         const z = prev, pz = await perf();
@@ -615,6 +635,8 @@ async function main() {
           boxesMean: fin(per.reduce((s, p) => s + p.boxes, 0) / (per.length || 1)),
           cameraVencFps: z.venc != null && a.venc != null ? fin((z.venc - a.venc) / dt) : null,
           cameraCpuPct: z.cpuAll > a.cpuAll ? Math.round(100 * (1 - (z.cpuIdle - a.cpuIdle) / (z.cpuAll - a.cpuAll))) : null,
+          players: [...players].map(p => p || 'none'),
+          analyticsOpened: z.anOpened,
           perSecondFps: per.map(p => p.fps),
         };
       }
@@ -629,15 +651,45 @@ async function main() {
     console.log(JSON.stringify({ feed, throttle, boxes: feed === 'synthetic' ? boxes : null, rate: feed === 'synthetic' ? rate : null, decoder, toggles, seconds, warmup, results }, null, 1));
     const m = results.motion, l = results.live;
     const fpsPct = +(process.env.MOTION_FPS_PCT || 15), dropX = +(process.env.MOTION_DROP_X || 2), delayMs = +(process.env.MOTION_DELAY_MS || 150);
+    const stallS = +(process.env.MOTION_STALL_S || 1);
+    console.log('TAB  motion: ' + m.fps + ' fps (min ' + m.fpsMin + '), ' + m.dropped + ' dropped, ' + m.freezes + ' freezes, delay ' + m.delayMs + ' ms, long tasks ' + m.longTaskMsPerS + ' ms/s, layout ' + m.layoutMsPerS + ' ms/s, ' + m.analyticsPerS + ' events/s, camera ' + m.cameraVencFps + ' fps ' + m.cameraCpuPct + '% cpu');
+    console.log('CTRL live:   ' + l.fps + ' fps (min ' + l.fpsMin + '), ' + l.dropped + ' dropped, ' + l.freezes + ' freezes, delay ' + l.delayMs + ' ms, long tasks ' + l.longTaskMsPerS + ' ms/s, layout ' + l.layoutMsPerS + ' ms/s, camera ' + l.cameraVencFps + ' fps ' + l.cameraCpuPct + '% cpu');
+
+    // First, whether the run measured what it says it did. Any of these makes
+    // the comparison below meaningless, whatever it would have concluded.
+    const invalid = [];
+    for (const [name, r] of [['the Motion tab', m], ['the Live page', l]]) {
+      if (r.fps == null) invalid.push(name + ' exposed no frame count (player ' + r.player + ')');
+      else if (!(r.fps > 0)) invalid.push(name + ' decoded no frames in its window');
+      // A requested decoder is a claim about the run; a page that fell back
+      // to another player, or changed player mid-window, did not run it.
+      const want = { webrtc: 'webrtc', mse: 'video', wasm: 'wasm' }[decoder];
+      if (want && (r.players.length !== 1 || r.players[0] !== want))
+        invalid.push(name + ' played through ' + r.players.join(' then ') + ', not the requested ' + decoder);
+      else if (r.players.length !== 1) invalid.push(name + ' changed player mid-window: ' + r.players.join(' then '));
+    }
+    if (feed !== 'off' && !m.analyticsOpened) invalid.push('the Motion tab never opened /ws/analytics, so no detection reached it');
+    else if (feed !== 'off' && !(m.analyticsPerS > 0)) invalid.push(feed === 'camera'
+      ? 'the camera sent no detections while the picture was flipping, so the overlay was never exercised'
+      : 'the synthetic feed delivered no detections');
+    if (refused) invalid.push(refused + ' of the picture flips were refused (last: HTTP ' + lastRefusal + '), so the scene did not move as the run assumed');
+    if (invalid.length) { console.log('FAIL: the run is not a valid comparison: ' + invalid.join('; ')); return false; }
+
     const why = [];
-    if (m.fps == null || l.fps == null) { console.log('FAIL: no frame count on ' + (m.fps == null ? 'the Motion tab' : 'the Live page') + ' (player ' + (m.fps == null ? m.player : l.player) + ')'); return false; }
-    if (feed === 'camera' && !(m.analyticsPerS > 0)) why.push('the camera sent no detections while the picture was flipping, so the overlay was never exercised');
     if (m.fps < l.fps * (1 - fpsPct / 100)) why.push('fps ' + m.fps + ' against ' + l.fps);
     if (m.dropped > l.dropped * dropX + 5) why.push('dropped ' + m.dropped + ' against ' + l.dropped);
     if (m.delayMs != null && l.delayMs != null && m.delayMs > l.delayMs + delayMs) why.push('picture delay ' + m.delayMs + ' ms against ' + l.delayMs + ' ms');
-    console.log('TAB  motion: ' + m.fps + ' fps (min ' + m.fpsMin + '), ' + m.dropped + ' dropped, delay ' + m.delayMs + ' ms, long tasks ' + m.longTaskMsPerS + ' ms/s, layout ' + m.layoutMsPerS + ' ms/s, ' + m.analyticsPerS + ' events/s, camera ' + m.cameraVencFps + ' fps ' + m.cameraCpuPct + '% cpu');
-    console.log('CTRL live:   ' + l.fps + ' fps (min ' + l.fpsMin + '), ' + l.dropped + ' dropped, delay ' + l.delayMs + ' ms, long tasks ' + l.longTaskMsPerS + ' ms/s, layout ' + l.layoutMsPerS + ' ms/s, camera ' + l.cameraVencFps + ' fps ' + l.cameraCpuPct + '% cpu');
+    // A one-second stall barely moves a 30-second average, so the worst
+    // seconds are compared too: seconds at under half the control's mean rate,
+    // and freezes where the player reports them.
+    const slow = r => r.perSecondFps.filter(f => f != null && f < l.fps / 2).length;
+    const ms = slow(m), cs = slow(l);
+    if (ms > cs + stallS) why.push(ms + ' seconds under half of ' + l.fps + ' fps against ' + cs);
+    if (m.freezes != null && l.freezes != null && m.freezes > l.freezes + stallS) why.push(m.freezes + ' freezes against ' + l.freezes);
     if (why.length) { console.log('FAIL: the Motion tab plays worse than Live: ' + why.join('; ')); ok = false; }
+    // A refused restore has already failed the run, and a PASS beside it
+    // would be read as the run's answer.
+    else if (!ok) console.log('FAIL: the pages compare equally, but the camera\'s picture settings were not restored');
     else console.log('PASS: the Motion tab plays as Live does');
   } else if (task === 'live') {
     // live <url> [waitMs] [transport] [stream]
