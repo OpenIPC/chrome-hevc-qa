@@ -26,6 +26,7 @@ CAMERA_USER=root CAMERA_PASS='...' ./hevc-chrome preview http://<camera>/cgi-bin
 CAMERA_USER=root CAMERA_PASS='...' ./hevc-chrome live http://<camera>/cgi-bin/live.cgi 60000 mse 0   # Live page over MSE; catches /ws/video leaks and init-re-emit thrash
 CAMERA_USER=root CAMERA_PASS='...' ./hevc-chrome dc http://<camera>/ 16 1 [negotiated|dcep|mixed]     # the bitstream over an RTCDataChannel; probe in web/dc-probe.js
 CAMERA_USER=root CAMERA_PASS='...' ./hevc-chrome bench http://<camera>/cgi-bin/live.cgi 60 datachannel 1 mse  # one measured run of a feed; JSON + PASS/FAIL
+CAMERA_USER=root CAMERA_PASS='...' ./hevc-chrome motion http://<camera>/ 30 camera   # Motion Detection tab vs Live; feed synthetic|camera|off, decoder auto|webrtc|mse|wasm
 ./hevc-chrome tunnel <camera-host>          # only if the container has no route to the camera;
 ./hevc-chrome untunnel                      # then the url is http://172.17.0.1:18080/...
 ./hevc-chrome sysinfo        # only when something fails: Chrome's GPU view + stderr
