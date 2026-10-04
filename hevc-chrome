@@ -10,6 +10,7 @@
 #   ./hevc-chrome play <clip|url> [offscreen]
 #   ./hevc-chrome preview <url> [waitMs] [clickSelector] [expectCodec]
 #   ./hevc-chrome shot <url> <out.png> [waitMs] [selector]   PNG into shots/
+#   ./hevc-chrome motion <url> [seconds] [feed] [boxes] [rate] [decoder]   Motion tab vs Live
 #   ./hevc-chrome selfcheck                 vainfo + caps + 4K HEVC playback
 #   ./hevc-chrome tunnel <camera-host> [port]   ssh -L to a camera's web port (no direct route)
 #   ./hevc-chrome untunnel [port]
@@ -46,6 +47,7 @@ run() {  # run <args...>: docker run with the GPU, as the invoking user
         -v "$here/clips:/work" -e HOME=/home/qa \
         ${CAMERA_USER:+-e CAMERA_USER -e CAMERA_PASS} \
         ${MAX_REBUILDS:+-e MAX_REBUILDS} ${FORCE_SOFTWARE:+-e FORCE_SOFTWARE} ${WASM_BASE:+-e WASM_BASE} ${FEED:+-e FEED} ${BENCH_LABEL:+-e BENCH_LABEL} ${BENCH_ICE:+-e BENCH_ICE} ${BENCH_WARMUP_S:+-e BENCH_WARMUP_S} ${BENCH_OUT:+-e BENCH_OUT} ${BENCH_SAMPLES:+-e BENCH_SAMPLES} \
+        ${MOTION_WARMUP_S:+-e MOTION_WARMUP_S} ${MOTION_CSS:+-e MOTION_CSS} ${MOTION_FPS_PCT:+-e MOTION_FPS_PCT} ${MOTION_DROP_X:+-e MOTION_DROP_X} ${MOTION_DELAY_MS:+-e MOTION_DELAY_MS} ${MOTION_CPU_THROTTLE:+-e MOTION_CPU_THROTTLE} \
         ${HEVC_VERBOSE:+-e HEVC_VERBOSE=1} ${DOCKER_EXTRA:-} "$image" "$@"
 }
 
@@ -64,7 +66,7 @@ case "$cmd" in
         run vainfo --display drm --device /dev/dri/renderD128 ;;
     clips)
         run /opt/make-clips.sh ;;
-    sysinfo|caps|preview|live|eval|watch|dc|bench)
+    sysinfo|caps|preview|live|eval|watch|dc|bench|motion)
         run chrome "$cmd" "$@" ;;
     shot)
         # The output lands in shots/ on the host, named by the second
